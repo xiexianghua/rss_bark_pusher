@@ -1,1 +1,0 @@
-docker run -d -p 5000:5000 --name my-rss-pusher -v rss_bark_data:/app rss-bark-pusher
