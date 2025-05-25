@@ -1,0 +1,4 @@
+build/
+__pycache__/
+data/subscriptions.db
+.env

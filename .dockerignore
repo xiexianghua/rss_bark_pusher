@@ -1,0 +1,20 @@
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.git/
+.gitignore
+.vscode/
+subscriptions.db
+# *.db  # 通常数据库文件不应该包含在镜像中，而是通过卷挂载
+# 如果 subscriptions.db 是空的或者只是初始结构，可以考虑包含它
+# 但更好的做法是让容器启动时通过 init_db() 创建
+# 或者通过挂载持久化。
+# 为了简单起见，如果首次运行时需要数据库文件存在，可以不忽略它，
+# 或者修改 app.py 在启动时总是调用 init_db()
+# (当前代码逻辑是如果文件不存在则调用 init_db())

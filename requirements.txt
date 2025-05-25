@@ -1,0 +1,6 @@
+Flask
+feedparser
+requests
+APScheduler
+beautifulsoup4
+gunicorn
