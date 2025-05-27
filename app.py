@@ -218,7 +218,7 @@ def process_feed(subscription_id, is_test_run=False):
 
     feed_content = None
     try:
-        headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.2 (sub_id:{sub["id"]})'}
+        headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub["id"]})'} 
         response = requests.get(sub['url'], headers=headers, timeout=FEED_REQUEST_TIMEOUT)
         response.raise_for_status()
         feed_content = response.content
@@ -248,9 +248,7 @@ def process_feed(subscription_id, is_test_run=False):
         return
 
     def get_entry_guid(entry):
-        # 使用 UTC 时间戳作为 fallback GUID 的一部分，确保一致性
         return entry.get('id', entry.get('link', entry.get('title', f"no_guid_fallback_{datetime.now(timezone.utc).timestamp()}")))
-
 
     last_known_guid = sub['last_fetched_item_guid']
     new_items_to_notify = []
@@ -266,6 +264,8 @@ def process_feed(subscription_id, is_test_run=False):
         temp_new_items = []
         if not last_known_guid: 
             if feed_data.entries:
+                # For first run, only take the newest single item to avoid flood.
+                # User can manually mark all as read if they want older items.
                 temp_new_items.append(feed_data.entries[0])
                 logger.info(f"首次运行 {sub['name']}, 标记最新条目: {feed_data.entries[0].get('title', '无标题')}")
         else:
@@ -274,14 +274,18 @@ def process_feed(subscription_id, is_test_run=False):
                 if entry_guid == last_known_guid:
                     break 
                 temp_new_items.append(entry) 
-        new_items_to_notify = list(reversed(temp_new_items)) 
+        new_items_to_notify = list(reversed(temp_new_items)) # Oldest new to newest new
 
     if not new_items_to_notify:
         logger.info(f"订阅 {sub['name']} 没有新内容。")
         return
 
     latest_sent_guid_this_run = None
-    for item in new_items_to_notify:
+    effective_title_prefix = "[测试] " if is_test_run else ""
+    success_flag = False # Flag to track if notification was sent successfully
+
+    if len(new_items_to_notify) == 1:
+        item = new_items_to_notify[0]
         title = item.get('title', '无标题')
         link = item.get('link', '')
         
@@ -289,32 +293,73 @@ def process_feed(subscription_id, is_test_run=False):
         soup = BeautifulSoup(raw_summary, "html.parser")
         body_content = soup.get_text(separator=' ', strip=True)
         
-        effective_title_prefix = "[测试] " if is_test_run else ""
         effective_title = f"{effective_title_prefix}{sub['name']}: {title}"
 
-        logger.info(f"准备发送 Bark 通知: Feed='{sub['name']}', Title='{title}' (Test: {is_test_run})")
+        logger.info(f"准备发送 Bark 通知 (单个条目): Feed='{sub['name']}', Title='{title}' (Test: {is_test_run})")
         
-        success, response_data = send_bark_notification(
+        success_flag, response_data = send_bark_notification(
             device_key=sub['bark_key'],
             title=effective_title,
-            body=body_content[:500], 
+            body=body_content[:500], # Truncate body for single item
             url=link if link else None, 
             group=sub['name']
         )
 
-        if success:
+        if success_flag:
             logger.info(f"Bark 通知发送成功 for '{title}'. Message ID: {response_data.get('messageid', 'N/A')}")
             if not is_test_run:
                 latest_sent_guid_this_run = get_entry_guid(item)
         else:
             logger.error(f"Bark 通知发送失败 for '{title}'. 错误: {response_data.get('message', '未知错误')}")
-            break 
+            
+    elif len(new_items_to_notify) > 1:
+        num_new_items = len(new_items_to_notify)
+        aggregated_title = f"{effective_title_prefix}{sub['name']} 有 {num_new_items} 条新更新"
+        
+        aggregated_body_titles_part = []
+        aggregated_body_links_part = []
+        
+        # new_items_to_notify is already chronologically ordered (oldest new to newest new)
+        for i, item in enumerate(new_items_to_notify):
+            item_title = item.get('title', '无标题')
+            item_link = item.get('link', '') 
+            
+            aggregated_body_titles_part.append(f"{i+1}. {item_title}")
+            if item_link: 
+                aggregated_body_links_part.append(f"链接{i+1}: {item_link}")
+            else:
+                aggregated_body_links_part.append(f"链接{i+1}: (无链接)")
 
-    if latest_sent_guid_this_run and not is_test_run:
+        aggregated_body = "\n".join(aggregated_body_titles_part)
+        if aggregated_body_links_part: 
+            aggregated_body += "\n---\n" 
+            aggregated_body += "\n".join(aggregated_body_links_part)
+        
+        primary_url_for_notification = new_items_to_notify[-1].get('link', sub['url'])
+
+        logger.info(f"准备发送 Bark 通知 (聚合 {num_new_items} 条目): Feed='{sub['name']}' (Test: {is_test_run})")
+        success_flag, response_data = send_bark_notification(
+            device_key=sub['bark_key'],
+            title=aggregated_title,
+            body=aggregated_body[:2000], # Increased limit for aggregated body
+            url=primary_url_for_notification, 
+            group=sub['name']
+        )
+
+        if success_flag:
+            logger.info(f"聚合 Bark 通知发送成功 for {num_new_items} items from '{sub['name']}'. Message ID: {response_data.get('messageid', 'N/A')}")
+            if not is_test_run:
+                latest_item_in_batch = new_items_to_notify[-1] 
+                latest_sent_guid_this_run = get_entry_guid(latest_item_in_batch)
+        else:
+            logger.error(f"聚合 Bark 通知发送失败 for '{sub['name']}'. 错误: {response_data.get('message', '未知错误')}")
+
+    if latest_sent_guid_this_run and not is_test_run: 
         update_subscription_last_item(sub['id'], latest_sent_guid_this_run)
         logger.info(f"更新订阅 {sub['name']} 的 last_fetched_item_guid 为: {latest_sent_guid_this_run}")
-    elif is_test_run and new_items_to_notify:
+    elif is_test_run and new_items_to_notify: 
         logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_guid 未更新。")
+
 
 # --- Scheduler Management ---
 def schedule_feed_job(subscription):
@@ -334,12 +379,12 @@ def schedule_feed_job(subscription):
         try:
             scheduler.add_job(
                 func=process_feed,
-                trigger=IntervalTrigger(minutes=subscription['interval_minutes'], timezone=timezone.utc), # 确保 trigger 也使用 UTC
+                trigger=IntervalTrigger(minutes=subscription['interval_minutes'], timezone=timezone.utc), 
                 args=[subscription['id']],
                 id=job_id,
                 name=f"Check {subscription['name']}",
                 replace_existing=True, 
-                next_run_time=datetime.now(timezone.utc) # 立即或尽快运行一次 (使用 UTC)
+                next_run_time=datetime.now(timezone.utc) 
             )
             logger.info(f"已为 '{subscription['name']}' (ID: {subscription['id']}) 调度任务，间隔: {subscription['interval_minutes']} 分钟。下次运行：ASAP")
         except Exception as e:
@@ -375,8 +420,6 @@ def reschedule_all_jobs():
 def index():
     try:
         subscriptions_data = get_all_subscriptions()
-        # subscriptions_data 中的 datetime 对象是带 UTC 时区的
-        # Jinja 过滤器 'beijing_time' 将在模板中处理转换和格式化
     except Exception as e:
         logger.error(f"主页加载订阅时出错: {e}", exc_info=True)
         flash("加载订阅列表时出错，请查看日志。", "error")
@@ -437,27 +480,34 @@ def update_subscription_action(sub_id):
     interval_minutes_str = request.form.get('interval_minutes', '').strip()
     bark_key = request.form.get('bark_key', '').strip()
 
-    current_form_data = dict(original_sub)
+    current_form_data = dict(original_sub) # Start with original data
+    # Update with new form data, converting to string where necessary for re-rendering
     current_form_data.update({
-        'name': name, 'url': url_new, 
-        'interval_minutes': interval_minutes_str,
+        'name': name, 
+        'url': url_new, 
+        'interval_minutes': interval_minutes_str, # Keep as string for re-render
         'bark_key': bark_key
     })
 
+
     if not all([name, url_new, bark_key, interval_minutes_str]):
         flash('所有字段都是必填的。', 'error')
-        return render_template('edit_subscription.html', subscription=current_form_data)
+        # Pass current_form_data (which now includes user's attempted changes)
+        return render_template('edit_subscription.html', subscription=current_form_data) 
     
     try:
         interval_minutes = int(interval_minutes_str)
         if interval_minutes < 1:
             flash('抓取间隔不能小于1分钟。', 'error')
-            current_form_data['interval_minutes'] = interval_minutes # 保持用户输入的值
+            # Update current_form_data's interval_minutes to the parsed int for consistency if needed,
+            # or just keep it as the string. For rendering, string is fine.
+            # current_form_data['interval_minutes'] = interval_minutes # This would be int
             return render_template('edit_subscription.html', subscription=current_form_data)
     except ValueError:
         flash('抓取间隔必须是有效的数字。', 'error')
         return render_template('edit_subscription.html', subscription=current_form_data)
 
+    # Check for URL uniqueness only if URL has changed
     if url_new != original_sub['url']:
         try:
             with get_db_connection() as conn:
@@ -466,7 +516,8 @@ def update_subscription_action(sub_id):
                 ).fetchone()
                 if existing_sub_with_url:
                     flash(f"URL '{url_new}' 已被ID为 {existing_sub_with_url['id']} 的其他订阅使用。", 'error')
-                    current_form_data['interval_minutes'] = interval_minutes
+                    # Update current_form_data with the validated int interval before re-rendering
+                    current_form_data['interval_minutes'] = interval_minutes 
                     return render_template('edit_subscription.html', subscription=current_form_data)
         except sqlite3.Error as e:
             logger.error(f"检查URL重复时发生数据库错误: {e}")
@@ -474,9 +525,9 @@ def update_subscription_action(sub_id):
             current_form_data['interval_minutes'] = interval_minutes
             return render_template('edit_subscription.html', subscription=current_form_data)
 
-    success = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key)
+    success_db_update = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key)
     
-    if success:
+    if success_db_update:
         updated_sub = get_subscription_by_id(sub_id)
         if updated_sub:
             schedule_feed_job(updated_sub)
@@ -485,7 +536,7 @@ def update_subscription_action(sub_id):
             flash(f"订阅 '{name}' 更新后无法从数据库重新加载。", 'error')
     else:
         flash(f"更新订阅 '{name}' 失败。请检查日志或确保URL唯一。", 'error')
-        current_form_data['interval_minutes'] = interval_minutes
+        current_form_data['interval_minutes'] = interval_minutes # Use the validated int
         return render_template('edit_subscription.html', subscription=current_form_data)
             
     return redirect(url_for('index'))
@@ -554,13 +605,22 @@ if not os.path.exists(db_dir_path):
         logger.info(f"数据目录 {db_dir_path} 已创建 (在 app.py 启动时)。")
     except OSError as e:
         logger.critical(f"无法创建数据目录 {db_dir_path}: {e}。应用可能无法正常工作。", exc_info=True)
+        # Consider exiting if data directory cannot be created, as DB operations will fail
         
 if not os.path.exists(DATABASE_FILE):
     logger.info(f"数据库文件 {DATABASE_FILE} 未找到，正在调用 init_db()...")
-    init_db() 
+    try:
+        init_db() 
+    except Exception as e:
+        logger.critical(f"首次初始化数据库失败: {e}. 应用可能无法启动。", exc_info=True)
+        # Consider exiting
 else:
     logger.info(f"使用现有数据库 {DATABASE_FILE}。调用 init_db() 以确保表结构和WAL模式...")
-    init_db() 
+    try:
+        init_db() 
+    except Exception as e:
+        logger.warning(f"检查/更新现有数据库时出错: {e}. 应用将尝试继续。", exc_info=True)
+
 
 if not scheduler.running:
     try:
@@ -575,15 +635,38 @@ else:
 
 if __name__ == '__main__':
     logger.info("以开发模式启动 Flask 应用 (python app.py)...")
+    
+    flask_debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    use_reloader_val = os.environ.get('FLASK_USE_RELOADER', 'False').lower() == 'true' # Default to False if not set
+
     # 确保 Flask app logger 和 Werkzeug logger 也使用北京时间 formatter
     # 这在开发模式下尤其重要
-    for h_app in app.logger.handlers:
-        h_app.setFormatter(beijing_formatter)
-    werkzeug_logger = logging.getLogger('werkzeug')
-    for h_werkzeug in werkzeug_logger.handlers:
-        h_werkzeug.setFormatter(beijing_formatter)
+    for flask_handler in app.logger.handlers:
+        flask_handler.setFormatter(beijing_formatter)
     
-    app.run(host='0.0.0.0', port=5000, debug=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true', use_reloader=False)
+    werkzeug_logger = logging.getLogger('werkzeug')
+    # Clear existing werkzeug handlers to avoid duplicate logs if reloader is on
+    for werkzeug_handler in werkzeug_logger.handlers[:]:
+        werkzeug_logger.removeHandler(werkzeug_handler)
+    
+    # Add our custom formatted handler to werkzeug
+    werkzeug_console_handler = logging.StreamHandler()
+    werkzeug_console_handler.setFormatter(beijing_formatter)
+    werkzeug_logger.addHandler(werkzeug_console_handler)
+    werkzeug_logger.propagate = False # Prevent werkzeug logs from going to root logger if we added our own
+
+    # APScheduler logger also needs formatting if its level is high enough to output
+    aps_logger = logging.getLogger('apscheduler')
+    for aps_handler in aps_logger.handlers[:]: # Clear existing if any
+        aps_logger.removeHandler(aps_handler)
+    aps_console_handler = logging.StreamHandler()
+    aps_console_handler.setFormatter(beijing_formatter)
+    aps_logger.addHandler(aps_console_handler)
+    # Set APScheduler log level (e.g., WARNING to reduce noise, or inherit from root)
+    aps_logger.setLevel(os.environ.get('APS_LOG_LEVEL', 'WARNING').upper())
+
+
+    app.run(host='0.0.0.0', port=5000, debug=flask_debug_mode, use_reloader=use_reloader_val)
 
     logger.info("开发服务器正在关闭...")
     if scheduler.running:

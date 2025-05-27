@@ -1,5 +1,9 @@
 import requests
 import json
+import logging # 添加日志记录
+import os
+
+logger = logging.getLogger(__name__) # 获取 logger 实例
 
 def send_bark_notification(device_key, body, title="", sound="", icon="", group="", url="", copy_text="", is_archive="0", level=""):
     """
@@ -17,7 +21,16 @@ def send_bark_notification(device_key, body, title="", sound="", icon="", group=
     is_archive (str, optional): 设置为 "1" 时，推送会直接存为历史记录，而不会弹出提示。
     level (str, optional): 推送级别 (iOS 15+)，可选 "active", "timeSensitive", "passive"。
     """
-    api_url = "https://api.day.app/push"
+    api_url = "https://api.day.app/push" # 默认官方API
+
+    # 允许通过环境变量覆盖 Bark API 地址
+    bark_api_server = os.environ.get('BARK_API_SERVER', '').strip()
+    if bark_api_server:
+        if bark_api_server.endswith('/'): # 移除末尾的 /
+            bark_api_server = bark_api_server[:-1]
+        api_url = f"{bark_api_server}/push"
+        logger.info(f"使用自定义 Bark API 服务器: {api_url}")
+
 
     payload = {
         "device_key": device_key,
@@ -36,7 +49,7 @@ def send_bark_notification(device_key, body, title="", sound="", icon="", group=
         payload["url"] = url
     if copy_text:
         payload["copy"] = copy_text # API 参数名为 'copy'
-    if is_archive == "1":
+    if is_archive == "1": # API期望的是字符串 "1"
         payload["isArchive"] = "1"
     if level:
         payload["level"] = level
@@ -44,57 +57,73 @@ def send_bark_notification(device_key, body, title="", sound="", icon="", group=
     headers = {
         "Content-Type": "application/json; charset=utf-8"
     }
+    
+    # 记录将要发送的payload (不记录device_key)
+    log_payload = payload.copy()
+    if 'device_key' in log_payload:
+        log_payload['device_key'] = '***REDACTED***'
+    logger.debug(f"发送 Bark 请求到 {api_url}，Payload: {log_payload}")
 
     try:
-        response = requests.post(api_url, data=json.dumps(payload), headers=headers)
+        response = requests.post(api_url, data=json.dumps(payload), headers=headers, timeout=10) # 添加超时
         response_json = response.json()
 
         if response.status_code == 200 and response_json.get("code") == 200:
-            print("Bark 通知发送成功！")
-            print(f"消息 ID: {response_json.get('messageid', 'N/A')}")
+            logger.info(f"Bark 通知发送成功！消息 ID: {response_json.get('messageid', 'N/A')}, Title: {title[:30]}")
             return True, response_json
         else:
-            print(f"Bark 通知发送失败。")
-            print(f"状态码: {response.status_code}")
-            print(f"错误信息: {response_json.get('message', '未知错误')}")
+            logger.error(f"Bark 通知发送失败。状态码: {response.status_code}, 错误: {response_json.get('message', '未知错误')}, Title: {title[:30]}")
             return False, response_json
+    except requests.exceptions.Timeout:
+        logger.error(f"请求 Bark API ({api_url}) 超时。Title: {title[:30]}")
+        return False, {"error": "Request Timeout", "message": f"请求 Bark API ({api_url}) 超时"}
     except requests.exceptions.RequestException as e:
-        print(f"请求 Bark API 时发生错误: {e}")
+        logger.error(f"请求 Bark API ({api_url}) 时发生错误: {e}, Title: {title[:30]}")
         return False, {"error": str(e)}
     except json.JSONDecodeError:
-        print(f"解析 Bark API 响应时发生错误。响应内容: {response.text}")
+        logger.error(f"解析 Bark API ({api_url}) 响应时发生错误。响应内容: {response.text}, Title: {title[:30]}")
         return False, {"error": "JSONDecodeError", "response_text": response.text}
 
 if __name__ == "__main__":
+    # 配置基本日志以便在直接运行时看到 bark_sender 的日志输出
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    logger.info("直接运行 bark_sender.py 进行测试...")
+    
     # #############################################
     # ## 请将 YOUR_BARK_KEY 替换为你的真实 Key ##
     # #############################################
-    my_bark_key = "YOUR_BARK_KEY" # <--- 在这里替换你的 Key
+    my_bark_key = os.environ.get("BARK_DEVICE_KEY", "YOUR_BARK_KEY") # 尝试从环境变量获取
 
     if my_bark_key == "YOUR_BARK_KEY":
-        print("错误：请在代码中替换 'YOUR_BARK_KEY' 为您真实的 Bark Key。")
-        print("您可以从 Bark App 的设置中找到您的 Key，通常以 https://api.day.app/ 开头，后面跟着一串字符。")
+        logger.error("错误：请在代码中替换 'YOUR_BARK_KEY' 为您真实的 Bark Key，或设置 BARK_DEVICE_KEY 环境变量。")
+        logger.info("您可以从 Bark App 的设置中找到您的 Key，通常以 https://api.day.app/ 开头，后面跟着一串字符。")
     else:
+        logger.info(f"使用 Bark Key: ...{my_bark_key[-4:]}") # 仅显示末尾几位
+
         # 示例 1: 发送简单文本通知
-        print("\n--- 示例 1: 发送简单文本通知 ---")
+        logger.info("\n--- 示例 1: 发送简单文本通知 ---")
         success, result = send_bark_notification(
             device_key=my_bark_key,
             body="这是 Python 发送的 Bark 测试消息！"
         )
-        print(f"发送结果: {'成功' if success else '失败'}")
+        logger.info(f"发送结果: {'成功' if success else '失败'}, 响应: {result}")
 
         # 示例 2: 发送带标题和声音的通知
-        print("\n--- 示例 2: 发送带标题和声音的通知 ---")
+        logger.info("\n--- 示例 2: 发送带标题和声音的通知 ---")
         success, result = send_bark_notification(
             device_key=my_bark_key,
             title="Python 通知",
             body="这条消息有标题，并且会播放'提示音(calypso)'铃声。",
             sound="calypso" # 您可以尝试不同的铃声，如 bell, birding, glass 等
         )
-        print(f"发送结果: {'成功' if success else '失败'}")
+        logger.info(f"发送结果: {'成功' if success else '失败'}, 响应: {result}")
 
         # 示例 3: 发送带 URL 跳转和自定义图标的通知
-        print("\n--- 示例 3: 发送带 URL 跳转和自定义图标的通知 ---")
+        logger.info("\n--- 示例 3: 发送带 URL 跳转和自定义图标的通知 ---")
         success, result = send_bark_notification(
             device_key=my_bark_key,
             title="重要更新",
@@ -103,35 +132,4 @@ if __name__ == "__main__":
             icon="https://www.python.org/static/favicon.ico", # 图标URL必须是https
             group="Python脚本"
         )
-        print(f"发送结果: {'成功' if success else '失败'}")
-
-        # 示例 4: 发送通知并自动复制内容
-        print("\n--- 示例 4: 发送通知并自动复制内容 ---")
-        success, result = send_bark_notification(
-            device_key=my_bark_key,
-            title="验证码",
-            body="您的验证码是 123456，已自动复制。",
-            copy_text="123456",
-            sound="gotosleep"
-        )
-        print(f"发送结果: {'成功' if success else '失败'}")
-
-        # 示例 5: 发送静默通知 (直接归档，不提示)
-        print("\n--- 示例 5: 发送静默通知 (直接归档，不提示) ---")
-        success, result = send_bark_notification(
-            device_key=my_bark_key,
-            title="后台任务完成",
-            body="数据备份已完成。",
-            is_archive="1" # 设置为 "1" 表示直接归档
-        )
-        print(f"发送结果: {'成功' if success else '失败'}")
-
-        # 示例 6: 发送指定推送级别的通知 (iOS 15+)
-        print("\n--- 示例 6: 发送指定推送级别的通知 (iOS 15+) ---")
-        success, result = send_bark_notification(
-            device_key=my_bark_key,
-            title="紧急警报",
-            body="这是一个时效性通知 (Time Sensitive)。",
-            level="timeSensitive" # 可选: active, timeSensitive, passive
-        )
-        print(f"发送结果: {'成功' if success else '失败'}")
+        logger.info(f"发送结果: {'成功' if success else '失败'}, 响应: {result}")
