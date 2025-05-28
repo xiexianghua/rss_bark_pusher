@@ -1,84 +1,51 @@
-<!-- templates/edit_subscription.html -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>编辑 RSS 订阅</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 20px; background-color: #f4f7f6; color: #333; line-height: 1.6; }
-        .container { max-width: 700px; margin: 0 auto; background-color: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 15px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; border-bottom: 2px solid #17a2b8; padding-bottom: 10px; margin-bottom: 30px; text-align: center;}
-        .form-group { margin-bottom: 18px; }
-        label { display: block; margin-bottom: 6px; font-weight: 500; color: #555; }
-        input[type="text"], input[type="url"], input[type="number"] {
-            width: calc(100% - 24px);
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 5px;
-            box-sizing: border-box;
-            transition: border-color 0.3s;
-        }
-        input[type="text"]:focus, input[type="url"]:focus, input[type="number"]:focus {
-            border-color: #17a2b8;
-            outline: none;
-        }
-        input[type="submit"], .button-link {
-            background-color: #007bff;
-            color: white;
-            padding: 10px 18px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 1em;
-            text-decoration: none;
-            display: inline-block;
-            transition: background-color 0.3s;
-            margin-right: 10px;
-        }
-        input[type="submit"]:hover, .button-link:hover { background-color: #0056b3; }
-        .button-cancel { background-color: #6c757d; }
-        .button-cancel:hover { background-color: #545b62; }
-        .message { padding: 12px 18px; margin-bottom: 20px; border-radius: 5px; border: 1px solid transparent; }
-        .message.success { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
-        .message.error { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
-        .form-actions { margin-top: 25px; }
-    </style>
+    <title>编辑订阅: {{ subscription.name }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body>
-    <div class="container">
-        <h1><span style="font-size: 1.2em;">✏️</span> 编辑订阅: {{ subscription.name }}</h1>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-6">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">✏️ 编辑订阅: {{ subscription.name }}</h1>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
-                {% for category, message in messages %}
-                    <div class="message {{ category }}">{{ message }}</div>
-                {% endfor %}
+                <div class="mb-4">
+                    {% for category, message in messages %}
+                        <div class="p-4 rounded-md {% if category == 'success' %}bg-green-100 text-green-700{% elif category == 'error' %}bg-red-100 text-red-700{% else %}bg-blue-100 text-blue-700{% endif %}">
+                            {{ message }}
+                        </div>
+                    {% endfor %}
+                </div>
             {% endif %}
         {% endwith %}
 
-        <form method="POST" action="{{ url_for('update_subscription_action', sub_id=subscription.id) }}">
-            <div class="form-group">
-                <label for="name">订阅名称:</label>
-                <input type="text" id="name" name="name" value="{{ subscription.name }}" required>
-            </div>
-            <div class="form-group">
-                <label for="url">RSS/Atom 链接:</label>
-                <input type="url" id="url" name="url" value="{{ subscription.url }}" required>
-            </div>
-            <div class="form-group">
-                <label for="interval_minutes">抓取间隔 (分钟):</label>
-                <input type="number" id="interval_minutes" name="interval_minutes" value="{{ subscription.interval_minutes }}" min="1" required>
-            </div>
-            <div class="form-group">
-                <label for="bark_key">Bark Key:</label>
-                <input type="text" id="bark_key" name="bark_key" value="{{ subscription.bark_key }}" required>
-            </div>
-            <div class="form-actions">
-                <input type="submit" value="更新订阅">
-                <a href="{{ url_for('index') }}" class="button-link button-cancel">取消</a>
-            </div>
-        </form>
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <form method="POST" action="{{ url_for('update_subscription_action', sub_id=subscription.id) }}">
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2" for="name">订阅名称:</label>
+                    <input type="text" id="name" name="name" value="{{ subscription.name }}" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2" for="url">RSS/Atom 链接:</label>
+                    <input type="url" id="url" name="url" value="{{ subscription.url }}" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2" for="interval_minutes">抓取间隔 (分钟):</label>
+                    <input type="number" id="interval_minutes" name="interval_minutes" value="{{ subscription.interval_minutes }}" min="1" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2" for="bark_key">Bark Key:</label>
+                    <input type="text" id="bark_key" name="bark_key" value="{{ subscription.bark_key }}" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                </div>
+                <div class="flex space-x-4">
+                    <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">保存更改</button>
+                    <a href="{{ url_for('index') }}" class="w-full text-center bg-gray-300 text-gray-800 px-4 py-2 rounded-md hover:bg-gray-400">取消</a>
+                </div>
+            </form>
+        </div>
     </div>
 </body>
 </html>
