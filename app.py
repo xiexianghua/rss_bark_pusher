@@ -2,9 +2,11 @@
 import os
 import sqlite3
 import logging
+import gc
 from datetime import datetime, timezone, timedelta
 import feedparser
-import requests
+import aiohttp
+import asyncio
 from flask import Flask, render_template, request, redirect, url_for, flash
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -35,7 +37,7 @@ FEED_REQUEST_TIMEOUT = int(os.environ.get('FEED_REQUEST_TIMEOUT', 20))
 BEIJING_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
 
 # --- 日志配置 (使用北京时间) ---
-LOG_LEVEL_STR = os.environ.get('LOG_LEVEL', 'INFO').upper()
+LOG_LEVEL_STR = os.environ.get('LOG_LEVEL', 'INFO').upper()  # 默认 WARNING
 LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 
 class BeijingTimeFormatter(logging.Formatter):
@@ -78,10 +80,10 @@ def format_datetime_to_beijing_time(dt_obj, fmt='%Y-%m-%d %H:%M:%S'):
 
 app.jinja_env.filters['beijing_time'] = format_datetime_to_beijing_time
 
-# 配置 APScheduler 线程池
+# 配置 APScheduler 线程池，降低 max_workers 以减少内存占用
 scheduler = BackgroundScheduler(
     timezone=timezone.utc,
-    executors={'default': {'type': 'threadpool', 'max_workers': 20}}
+    executors={'default': {'type': 'threadpool', 'max_workers': 3}}  # 降低到 5
 )
 
 # --- 数据库操作函数 ---
@@ -253,33 +255,40 @@ def get_daily_feed_titles():
         return []
 
 # --- RSS Processing and Bark Notification ---
+async def fetch_feed_content(url, sub_id):
+    headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub_id})'}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT) as response:
+                response.raise_for_status()
+                content = await response.read()
+                logger.debug(f"成功获取订阅内容，字节数: {len(content)}")
+                return content
+        except aiohttp.ClientTimeout:
+            logger.error(f"抓取订阅 {url} 超时 (超过 {FEED_REQUEST_TIMEOUT} 秒)。")
+            return None
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"抓取订阅 {url} 时发生 HTTP 错误: {e.status} {e.message}")
+            return None
+        except aiohttp.ClientError as e:
+            logger.error(f"抓取订阅 {url} 失败: {e}")
+            return None
+
 def process_feed(subscription_id, is_test_run=False):
     sub = get_subscription_by_id(subscription_id)
     if not sub:
         logger.warning(f"订阅 {subscription_id} 在 process_feed 中未找到，跳过处理。")
         return
     
-    logger.info(f"开始处理订阅: {sub['name']} ({sub['url']})")
+    logger.info(f"开始处理订阅: {sub['name']} ({sub['url']}) (Active: {sub['is_active']}, Test: {is_test_run})")
     update_subscription_last_checked(sub['id'])
 
-    feed_content = None
-    try:
-        headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub["id"]})'}
-        response = requests.get(sub['url'], headers=headers, timeout=FEED_REQUEST_TIMEOUT)
-        response.raise_for_status()
-        feed_content = response.content
-        logger.debug(f"成功获取订阅 {sub['name']} 内容，字节数: {len(feed_content)}")
-    except requests.exceptions.Timeout:
-        logger.error(f"抓取订阅 {sub['name']} ({sub['url']}) 超时 (超过 {FEED_REQUEST_TIMEOUT} 秒)。")
-        return
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"抓取订阅 {sub['name']} ({sub['url']}) 时发生 HTTP 错误: {e.response.status_code} {e.response.reason}")
-        return
-    except requests.exceptions.RequestException as e:
-        logger.error(f"抓取订阅 {sub['name']} ({sub['url']}) 失败: {e}")
-        return
-    except Exception as e:
-        logger.error(f"获取订阅 {sub['name']} ({sub['url']}) 内容时发生未知错误: {e}", exc_info=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    feed_content = loop.run_until_complete(fetch_feed_content(sub['url'], sub['id']))
+    loop.close()
+
+    if feed_content is None:
         return
 
     feed_data = feedparser.parse(feed_content)
@@ -310,6 +319,12 @@ def process_feed(subscription_id, is_test_run=False):
 
     if not sub['is_active'] and not is_test_run:
         logger.info(f"订阅 {sub['name']} 未激活，跳过Bark通知，但已保存条目用于总结。")
+        # 更新 last_fetched_item_guid 即使订阅未激活，确保下次激活时不会推送旧内容
+        if feed_data.entries:
+            latest_entry_guid = get_entry_guid(feed_data.entries[0])
+            if sub['last_fetched_item_guid'] != latest_entry_guid:
+                 update_subscription_last_item(sub['id'], latest_entry_guid)
+                 logger.info(f"非激活订阅 {sub['name']} 更新了 last_fetched_item_guid 为: {latest_entry_guid} (用于防止激活后推送旧内容)")
         return
 
     last_known_guid = sub['last_fetched_item_guid']
@@ -338,6 +353,13 @@ def process_feed(subscription_id, is_test_run=False):
 
     if not new_items_to_notify:
         logger.info(f"订阅 {sub['name']} 没有新内容。")
+        # 即使没有新内容，也更新 last_fetched_item_guid 为最新条目，如果它与当前不同
+        # 这可以防止在源清空旧条目后，下次出现新条目时，last_known_guid 找不到匹配而推送所有条目
+        if feed_data.entries and not is_test_run:
+            latest_entry_guid = get_entry_guid(feed_data.entries[0])
+            if sub['last_fetched_item_guid'] != latest_entry_guid:
+                update_subscription_last_item(sub['id'], latest_entry_guid)
+                logger.info(f"订阅 {sub['name']} 没有新通知内容，但更新了 last_fetched_item_guid 为: {latest_entry_guid}")
         return
 
     latest_sent_guid_this_run = None
@@ -414,6 +436,10 @@ def process_feed(subscription_id, is_test_run=False):
     elif is_test_run and new_items_to_notify:
         logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_guid 未更新。")
 
+    # 清理内存
+    del feed_data
+    gc.collect()
+
 # --- Gemini Summary Processing ---
 def generate_daily_summary():
     config = get_summary_config()
@@ -469,6 +495,8 @@ def generate_daily_summary():
             logger.error(f"每日总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
     except Exception as e:
         logger.error(f"调用 Gemini API 生成总结失败: {e}", exc_info=True)
+    finally:
+        gc.collect()
 
 # --- Scheduler Management ---
 def schedule_feed_job(subscription):
@@ -491,9 +519,10 @@ def schedule_feed_job(subscription):
             id=job_id,
             name=f"Check {subscription['name']}",
             replace_existing=True,
-            next_run_time=datetime.now(timezone.utc)
+            next_run_time=datetime.now(timezone.utc), # 立即运行一次
+            misfire_grace_time=60  # 允许任务延迟最多60秒执行，而不会报"missed"
         )
-        logger.info(f"已为 '{subscription['name']}' (ID: {subscription['id']}) 调度任务，间隔: {subscription['interval_minutes']} 分钟（带30秒jitter）。下次运行：ASAP")
+        logger.info(f"已为 '{subscription['name']}' (ID: {subscription['id']}, Active: {subscription['is_active']}) 调度任务，间隔: {subscription['interval_minutes']} 分钟（带30秒jitter）。下次运行：ASAP")
     except Exception as e:
         logger.error(f"为 '{subscription['name']}' (ID: {subscription['id']}) 调度任务失败: {e}", exc_info=True)
 
@@ -550,14 +579,13 @@ def schedule_cleanup_job():
         logger.error(f"调度每日清理任务失败: {e}", exc_info=True)
 
 def reschedule_all_jobs():
-    logger.info("重新加载并调度所有激活的订阅任务和总结任务...")
+    logger.info("重新加载并调度所有订阅任务和总结任务...")
     try:
         subscriptions = get_all_subscriptions()
     except Exception as e:
         logger.error(f"重新调度任务时无法获取订阅列表: {e}", exc_info=True)
         return
 
-    # 移除所有现有任务以避免重复
     for job in scheduler.get_jobs():
         if job.id.startswith("feed_") or job.id == "daily_summary" or job.id == "cleanup_feed_items":
             try:
@@ -568,11 +596,16 @@ def reschedule_all_jobs():
             except Exception as e:
                 logger.error(f"移除旧任务 {job.id} 时发生错误: {e}", exc_info=True)
 
+    # 修改点：为所有订阅（无论是否激活）都调度任务
+    # process_feed 函数内部会根据 is_active 状态决定是否发送通知
     for sub in subscriptions:
-        if sub['is_active']:  # 只为激活的订阅调度任务
-            schedule_feed_job(sub)
+        schedule_feed_job(sub) # 不再检查 sub['is_active']
+        # logger.info(f"在 reschedule_all_jobs 中为 '{sub['name']}' (Active: {sub['is_active']}) 调度任务。")
+
     schedule_summary_job()
     schedule_cleanup_job()
+    logger.info("所有任务重新调度完成。")
+
 
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
@@ -609,7 +642,7 @@ def add_subscription():
     if sub_id:
         new_sub = get_subscription_by_id(sub_id)
         if new_sub:
-            schedule_feed_job(new_sub)
+            schedule_feed_job(new_sub) # 新增订阅时，它默认是 active 的
             flash(f"订阅 '{name}' 添加成功并已调度。", 'success')
         else:
             flash(f"订阅 '{name}' 添加到数据库后无法立即检索。", 'error')
@@ -678,9 +711,9 @@ def update_subscription_action(sub_id):
     success_db_update = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key)
     
     if success_db_update:
-        updated_sub = get_subscription_by_id(sub_id)
+        updated_sub = get_subscription_by_id(sub_id) # is_active 状态不变
         if updated_sub:
-            schedule_feed_job(updated_sub)
+            schedule_feed_job(updated_sub) # 重新调度，会考虑其当前的 is_active 状态
             flash(f"订阅 '{name}' 更新成功并已重新调度。", 'success')
         else:
             flash(f"订阅 '{name}' 更新后无法从数据库重新加载。", 'error')
@@ -716,6 +749,7 @@ def test_subscription(sub_id):
     if sub:
         flash(f"正在测试订阅 '{sub['name']}'... 请检查你的 Bark 设备。如果源有最新内容，将会收到带'[测试]'前缀的通知。", 'info')
         try:
+            # 测试运行时，process_feed 内部会忽略 is_active 状态强制发送通知
             process_feed(sub_id, is_test_run=True)
         except Exception as e:
             logger.error(f"测试订阅 {sub['name']} 时发生意外错误: {e}", exc_info=True)
@@ -733,11 +767,14 @@ def toggle_subscription_status(sub_id):
 
     new_status_bool = toggle_subscription_active_status_in_db(sub_id)
     if new_status_bool is not None:
-        toggled_sub = get_subscription_by_id(sub_id)
+        toggled_sub = get_subscription_by_id(sub_id) # 获取更新后的订阅信息
         if toggled_sub:
+            # 无论激活还是暂停，都重新调度。
+            # schedule_feed_job 会创建/更新任务。
+            # process_feed 会根据 toggled_sub['is_active'] 决定是否发送通知。
             schedule_feed_job(toggled_sub)
             status_text = "激活" if new_status_bool else "暂停"
-            flash(f"订阅 '{toggled_sub['name']}' 已设置为 {status_text} 状态。", 'success')
+            flash(f"订阅 '{toggled_sub['name']}' 已设置为 {status_text} 状态并重新调度。", 'success')
         else:
             flash(f"订阅 '{sub_before_toggle['name']}' 状态已更改，但无法重新加载订阅信息。", 'error')
     else:
@@ -761,7 +798,6 @@ def summary_config():
                 'summary_bark_key': '', 'last_summary': None, 'last_summary_at': None
             }
 
-        # 如果用户没有输入新Key（即输入为“********”或空），使用隐藏字段的值
         if gemini_api_key == '********' or not gemini_api_key:
             gemini_api_key = gemini_api_key_hidden
         if summary_bark_key == '********' or not summary_bark_key:
@@ -886,7 +922,7 @@ if not scheduler.running:
     try:
         scheduler.start(paused=False)
         logger.info("调度器已启动。")
-        reschedule_all_jobs()
+        reschedule_all_jobs() # 在这里调用，确保所有订阅都被考虑
     except Exception as e:
         logger.critical(f"调度器启动失败: {e}", exc_info=True)
 else:
@@ -896,7 +932,7 @@ if __name__ == '__main__':
     logger.info("以开发模式启动 Flask 应用 (python app.py)...")
     
     flask_debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    use_reloader_val = os.environ.get('FLASK_USE_RELOADER', 'False').lower() == 'true'  # 更改为默认禁用自动重载
+    use_reloader_val = os.environ.get('FLASK_USE_RELOADER', 'False').lower() == 'true'
 
     for flask_handler in app.logger.handlers:
         flask_handler.setFormatter(beijing_formatter)

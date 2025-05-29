@@ -115,7 +115,7 @@ def get_db_connection(timeout_seconds=30):
             except Exception as e:
                 logger.error(f"关闭数据库连接时出错: {e}")
 
-def cleanup_old_feed_items(days=2):
+def cleanup_old_feed_items(days=1):  # 缩短到 1 天
     try:
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
@@ -140,11 +140,9 @@ def _add_column_if_not_exists(conn, table_name, column_name, column_type):
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
             logger.info(f"已向表 '{table_name}' 添加列 '{column_name} {column_type}'。")
         except sqlite3.OperationalError as e:
-            # 如果并发情况下多个实例尝试添加，可能会出错，但通常是安全的
             logger.warning(f"尝试向表 '{table_name}' 添加列 '{column_name}' 时发生错误 (可能已存在): {e}")
     else:
         logger.debug(f"列 '{column_name}' 已存在于表 '{table_name}'。")
-
 
 def init_db():
     logger.info(f"正在初始化数据库: {DATABASE_FILE}")
@@ -207,8 +205,9 @@ def init_db():
             ''')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_subscription_id ON feed_items(subscription_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_fetched_at ON feed_items(fetched_at);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_guid ON feed_items(guid);")  # 新增索引
 
-            # 创建 summary_config 表 (定义最新结构)
+            # 创建 summary_config 表
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS summary_config (
                     id INTEGER PRIMARY KEY,
@@ -221,28 +220,19 @@ def init_db():
                 )
             ''')
 
-            # --- Schema migration for summary_config table ---
-            # 确保所有预期的列都存在，以处理从旧版本升级的情况
+            # Schema migration for summary_config table
             logger.info("正在检查并迁移 summary_config 表结构...")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_prompt", "TEXT")
-            # interval_hours 通常有 DEFAULT，但如果表是手动创建的旧版本，可能没有
-            # _add_column_if_not_exists(conn, "summary_config", "interval_hours", "INTEGER DEFAULT 24") # ALTER TABLE ADD COLUMN with DEFAULT needs SQLite 3.3.0+
-                                                                                                     # Simpler to just add TEXT and let app logic handle default if needed or rely on INSERT OR IGNORE
             _add_column_if_not_exists(conn, "summary_config", "summary_bark_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary_at", "TIMESTAMP")
 
-
-            # 插入默认 summary_config 记录（如果不存在）
-            # 这将确保 id=1 的行存在。如果列是后面通过 ALTER TABLE 添加的，
-            # 它们在新行中会是 NULL，或在现有行中保持 NULL 直到被更新。
+            # 插入默认 summary_config 记录
             conn.execute('''
                 INSERT OR IGNORE INTO summary_config (id, interval_hours) 
                 VALUES (1, 24)
             ''')
-            # 如果 interval_hours 列是后加的，并且没有默认值，上面这个 INSERT OR IGNORE 可能不会设置它
-            # 为了确保 interval_hours 有值，可以做一个更新
             conn.execute('''
                 UPDATE summary_config SET interval_hours = COALESCE(interval_hours, 24) WHERE id = 1
             ''')
@@ -259,7 +249,7 @@ def init_db():
             if conn:
                 try:
                     conn.rollback()
-                except Exception: # nosec
+                except Exception:
                     pass
             raise
         finally:
@@ -267,7 +257,7 @@ def init_db():
                 conn.close()
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
     logger.info("直接运行 database.py 进行测试...")
     
     if os.path.exists(DATABASE_FILE):
@@ -300,7 +290,6 @@ if __name__ == '__main__':
             assert summary_row['interval_hours'] == 24, f"summary_config id=1 的 interval_hours ({summary_row['interval_hours']}) 不正确"
             logger.info("summary_config 默认行和 interval_hours 验证通过。")
 
-
             logger.info("测试时间戳转换...")
             conn_test.execute("DROP TABLE IF EXISTS test_datetime")
             conn_test.execute("CREATE TABLE test_datetime (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
@@ -328,7 +317,7 @@ if __name__ == '__main__':
             conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
                               (sub_id, "New Item", "guid_new", one_day_ago))
             conn_test.commit()
-            deleted_count = cleanup_old_feed_items(days=2)
+            deleted_count = cleanup_old_feed_items(days=1)
             assert deleted_count == 1, f"清理计数错误，应为1，实际为{deleted_count}"
             logger.info("feed_items 清理测试成功。")
 
