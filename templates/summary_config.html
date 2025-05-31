@@ -47,12 +47,12 @@
 
             <div class="mb-4">
                 <label for="summary_prompt" class="block text-sm font-medium text-gray-700">总结提示词:</label>
-                <textarea name="summary_prompt" id="summary_prompt" rows="5" class="mt-1 block w-full border border-gray-300 rounded p-2">{{ config.summary_prompt if config else '请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}' }}</textarea>
+                <textarea name="summary_prompt" id="summary_prompt" rows="5" class="mt-1 block w-full border border-gray-300 rounded p-2">{{ config.summary_prompt if config and config.summary_prompt is not none else '请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}' }}</textarea>
             </div>
 
             <div class="mb-4">
                 <label for="interval_hours" class="block text-sm font-medium text-gray-700">总结间隔 (小时):</label>
-                <input type="number" name="interval_hours" id="interval_hours" value="{{ config.interval_hours if config else 24 }}" min="1" class="mt-1 block w-full border border-gray-300 rounded p-2">
+                <input type="number" name="interval_hours" id="interval_hours" value="{{ config.interval_hours if config and config.interval_hours is not none else 24 }}" min="1" class="mt-1 block w-full border border-gray-300 rounded p-2">
             </div>
 
             <div class="flex space-x-2">
@@ -61,14 +61,57 @@
             </div>
         </form>
 
-        <div class="mb-6">
+        <div class="mb-6 flex space-x-2">
             <a href="{{ url_for('test_summary') }}" class="bg-purple-500 text-white px-4 py-2 rounded hover:bg-purple-600">测试总结</a>
+            <a href="{{ url_for('summary_config', show_items='true') }}" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">显示条目</a>
+            <a href="{{ url_for('summary_config', show_summary='true') }}" class="bg-indigo-500 text-white px-4 py-2 rounded hover:bg-indigo-600">显示总结</a> {# 新增按钮 #}
         </div>
 
-        {% if config and config.last_summary %}
-            <div class="bg-white p-6 rounded shadow-md">
-                <h2 class="text-xl font-semibold mb-2">上次总结结果 ({{ config.last_summary_at | beijing_time }})</h2>
-                <pre class="whitespace-pre-wrap">{{ config.last_summary }}</pre>
+        {% if show_items_area %}
+            <div class="mt-8 bg-white p-6 rounded shadow-md">
+                <h2 class="text-xl font-semibold mb-4">
+                    过去 {{ (config.interval_hours if config and config.interval_hours is not none else 24) }} 小时内的 RSS 条目
+                    {% if feed_items_for_summary is not none %}
+                        ({{ feed_items_for_summary | length }} 条)
+                    {% endif %}
+                </h2>
+                {% if feed_items_for_summary %}
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">订阅源</th>
+                                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">条目标题</th>
+                                    <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">获取时间 (北京)</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white divide-y divide-gray-200">
+                                {% for item in feed_items_for_summary %}
+                                <tr>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.subscription_name }}</td>
+                                    <td class="px-6 py-4 whitespace-normal text-sm text-gray-900 break-all">{{ item.item_title }}</td>
+                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ item.fetched_at | beijing_time }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                {% else %}
+                    <p class="text-gray-600">没有找到符合条件的 RSS 条目。</p>
+                {% endif %}
+            </div>
+        {% endif %}
+
+        {# 修改: 上次总结结果的显示现在由 show_summary_area 控制 #}
+        {% if show_summary_area %}
+            <div class="bg-white p-6 rounded shadow-md mt-6">
+                {% if config and config.last_summary %}
+                    <h2 class="text-xl font-semibold mb-2">上次总结结果 ({{ config.last_summary_at | beijing_time }})</h2>
+                    <pre class="whitespace-pre-wrap text-sm">{{ config.last_summary }}</pre>
+                {% else %}
+                    <h2 class="text-xl font-semibold mb-2">上次总结结果</h2>
+                    <p class="text-gray-600">数据库中还没有保存任何总结。</p>
+                {% endif %}
             </div>
         {% endif %}
     </div>

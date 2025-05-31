@@ -205,7 +205,7 @@ def init_db():
             ''')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_subscription_id ON feed_items(subscription_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_fetched_at ON feed_items(fetched_at);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_guid ON feed_items(guid);")  # 新增索引
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_guid ON feed_items(guid);")
 
             # 创建 summary_config 表
             conn.execute('''
@@ -220,7 +220,6 @@ def init_db():
                 )
             ''')
 
-            # Schema migration for summary_config table
             logger.info("正在检查并迁移 summary_config 表结构...")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_prompt", "TEXT")
@@ -228,7 +227,6 @@ def init_db():
             _add_column_if_not_exists(conn, "summary_config", "last_summary", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary_at", "TIMESTAMP")
 
-            # 插入默认 summary_config 记录
             conn.execute('''
                 INSERT OR IGNORE INTO summary_config (id, interval_hours) 
                 VALUES (1, 24)
@@ -256,10 +254,36 @@ def init_db():
             if conn:
                 conn.close()
 
+def get_detailed_feed_items_for_summary(interval_hours):
+    """
+    获取在指定总结时间间隔内的详细 RSS 条目信息。
+    返回一个包含订阅源名称、条目标题、GUID 和获取时间的条目列表，按获取时间降序排列。
+    """
+    try:
+        with get_db_connection() as conn:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
+            items = conn.execute(
+                """SELECT s.name AS subscription_name, f.title AS item_title, f.guid, f.fetched_at
+                   FROM feed_items f
+                   JOIN subscriptions s ON f.subscription_id = s.id
+                   WHERE f.fetched_at >= ?
+                   ORDER BY f.fetched_at DESC""",
+                (cutoff_time,)
+            ).fetchall()
+            logger.info(f"为总结显示获取了 {len(items)} 条过去 {interval_hours} 小时的详细条目。")
+            return items
+    except sqlite3.Error as e:
+        logger.error(f"获取用于总结的详细订阅条目时发生数据库错误: {e}")
+        return []
+
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s') # Changed to INFO for more output
     logger.info("直接运行 database.py 进行测试...")
     
+    test_db_file = os.path.join(os.path.dirname(DATABASE_FILE), "test_subscriptions.db")
+    DATABASE_FILE = test_db_file # Use a test-specific DB for this run
+    logger.info(f"测试将使用数据库: {DATABASE_FILE}")
+
     if os.path.exists(DATABASE_FILE):
         logger.info(f"为测试目的，删除现有数据库文件: {DATABASE_FILE}")
         os.remove(DATABASE_FILE)
@@ -275,7 +299,6 @@ if __name__ == '__main__':
             mode = conn_test.execute("PRAGMA journal_mode;").fetchone()[0]
             logger.info(f"当前 Journal Mode: {mode}")
             
-            # 验证 summary_config 表结构
             logger.info("验证 summary_config 表结构:")
             cursor = conn_test.execute("PRAGMA table_info(summary_config)")
             columns = [row['name'] for row in cursor.fetchall()]
@@ -284,7 +307,6 @@ if __name__ == '__main__':
                 assert col in columns, f"列 {col} 未在 summary_config 表中找到!"
             logger.info(f"summary_config 表列: {columns} - 验证通过")
 
-            # 验证 summary_config 默认行和 interval_hours
             summary_row = conn_test.execute("SELECT * FROM summary_config WHERE id = 1").fetchone()
             assert summary_row is not None, "summary_config id=1 的默认行未找到"
             assert summary_row['interval_hours'] == 24, f"summary_config id=1 的 interval_hours ({summary_row['interval_hours']}) 不正确"
@@ -307,19 +329,62 @@ if __name__ == '__main__':
             conn_test.commit()
 
             logger.info("测试清理旧 feed_items...")
-            sub_id = conn_test.execute("INSERT INTO subscriptions (name, url, bark_key) VALUES (?, ?, ?)", 
-                                       ("Test Sub", "http://example.com/rss", "testkey")).lastrowid
+            sub_id_cleanup = conn_test.execute("INSERT INTO subscriptions (name, url, bark_key) VALUES (?, ?, ?)", 
+                                       ("Test Sub Cleanup", "http://example.com/rss_cleanup", "testkey_cleanup")).lastrowid
             conn_test.commit()
-            three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
-            one_day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+            three_days_ago_cleanup = datetime.now(timezone.utc) - timedelta(days=3)
+            half_day_ago_cleanup = datetime.now(timezone.utc) - timedelta(hours=12) # Changed to half day for cleanup test
             conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id, "Old Item", "guid_old", three_days_ago))
+                              (sub_id_cleanup, "Old Item", "guid_old_cleanup", three_days_ago_cleanup))
             conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id, "New Item", "guid_new", one_day_ago))
+                              (sub_id_cleanup, "New Item", "guid_new_cleanup", half_day_ago_cleanup))
             conn_test.commit()
-            deleted_count = cleanup_old_feed_items(days=1)
+            deleted_count = cleanup_old_feed_items(days=1) # cleanup items older than 1 day
             assert deleted_count == 1, f"清理计数错误，应为1，实际为{deleted_count}"
             logger.info("feed_items 清理测试成功。")
 
+            logger.info("测试 get_detailed_feed_items_for_summary...")
+            sub_id_detail = conn_test.execute("INSERT INTO subscriptions (name, url, bark_key) VALUES (?, ?, ?)",
+                                       ("Detail Sub", "http://example.com/rss_detail", "testkey_detail")).lastrowid
+            conn_test.commit()
+            
+            # Add items for get_detailed_feed_items_for_summary test
+            # Item within 24 hours
+            item_1_time = datetime.now(timezone.utc) - timedelta(hours=5)
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail, "Recent Item 1", "guid_detail_1", item_1_time))
+            # Item outside 24 hours (e.g., 30 hours ago)
+            item_2_time = datetime.now(timezone.utc) - timedelta(hours=30)
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail, "Old Item Detail", "guid_detail_2", item_2_time))
+            # Item from another subscription, also recent
+            sub_id_detail_other = conn_test.execute("INSERT INTO subscriptions (name, url, bark_key) VALUES (?, ?, ?)",
+                                       ("Other Detail Sub", "http://example.com/rss_other_detail", "testkey_other_detail")).lastrowid
+            conn_test.commit()
+            item_3_time = datetime.now(timezone.utc) - timedelta(hours=2)
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail_other, "Recent Item Other Sub", "guid_detail_3", item_3_time))
+            conn_test.commit()
+            
+            detailed_items = get_detailed_feed_items_for_summary(interval_hours=24)
+            assert len(detailed_items) == 2, f"get_detailed_feed_items_for_summary 应返回2条记录，实际为{len(detailed_items)}"
+            
+            # Check ordering (most recent first)
+            assert detailed_items[0]['item_title'] == "Recent Item Other Sub"
+            assert detailed_items[1]['item_title'] == "Recent Item 1"
+            
+            logger.info(f"get_detailed_feed_items_for_summary 返回了 {len(detailed_items)} 条记录: {[item['item_title'] for item in detailed_items]} - 测试成功。")
+
+
     except Exception as e:
         logger.error(f"直接运行 database.py 测试时出错: {e}", exc_info=True)
+    finally:
+        # Clean up test database file
+        if os.path.exists(DATABASE_FILE):
+            logger.info(f"清理测试数据库文件: {DATABASE_FILE}")
+            # os.remove(DATABASE_FILE) # Comment out if you want to inspect it
+            # for suffix in ["-wal", "-shm"]:
+            #     wal_file = DATABASE_FILE + suffix
+            #     if os.path.exists(wal_file):
+            #         os.remove(wal_file)
+        pass # Keep test DB for inspection if needed

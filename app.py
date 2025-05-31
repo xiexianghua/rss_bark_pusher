@@ -28,7 +28,11 @@ except ImportError:
     print("错误: 无法导入 google-generativeai。请确保已安装：pip install -q -U google-generativeai")
     genai = None
 
-from database import get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock
+from database import (
+    get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
+    get_detailed_feed_items_for_summary
+)
+
 
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY', os.urandom(24))
 FEED_REQUEST_TIMEOUT = int(os.environ.get('FEED_REQUEST_TIMEOUT', 20))
@@ -37,7 +41,7 @@ FEED_REQUEST_TIMEOUT = int(os.environ.get('FEED_REQUEST_TIMEOUT', 20))
 BEIJING_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
 
 # --- 日志配置 (使用北京时间) ---
-LOG_LEVEL_STR = os.environ.get('LOG_LEVEL', 'INFO').upper()  # 默认 WARNING
+LOG_LEVEL_STR = os.environ.get('LOG_LEVEL', 'INFO').upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 
 class BeijingTimeFormatter(logging.Formatter):
@@ -80,10 +84,9 @@ def format_datetime_to_beijing_time(dt_obj, fmt='%Y-%m-%d %H:%M:%S'):
 
 app.jinja_env.filters['beijing_time'] = format_datetime_to_beijing_time
 
-# 配置 APScheduler 线程池，降低 max_workers 以减少内存占用
 scheduler = BackgroundScheduler(
     timezone=timezone.utc,
-    executors={'default': {'type': 'threadpool', 'max_workers': 3}}  # 降低到 5
+    executors={'default': {'type': 'threadpool', 'max_workers': 3}}
 )
 
 # --- 数据库操作函数 ---
@@ -238,8 +241,11 @@ def save_summary_result(summary_text):
 
 def get_daily_feed_titles():
     try:
-        config = get_summary_config()
-        interval_hours = config['interval_hours'] if config and config['interval_hours'] else 24
+        config_row = get_summary_config()
+        interval_hours = 24
+        if config_row and config_row['interval_hours'] is not None:
+            interval_hours = config_row['interval_hours']
+        
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
             titles = conn.execute(
@@ -319,7 +325,6 @@ def process_feed(subscription_id, is_test_run=False):
 
     if not sub['is_active'] and not is_test_run:
         logger.info(f"订阅 {sub['name']} 未激活，跳过Bark通知，但已保存条目用于总结。")
-        # 更新 last_fetched_item_guid 即使订阅未激活，确保下次激活时不会推送旧内容
         if feed_data.entries:
             latest_entry_guid = get_entry_guid(feed_data.entries[0])
             if sub['last_fetched_item_guid'] != latest_entry_guid:
@@ -353,8 +358,6 @@ def process_feed(subscription_id, is_test_run=False):
 
     if not new_items_to_notify:
         logger.info(f"订阅 {sub['name']} 没有新内容。")
-        # 即使没有新内容，也更新 last_fetched_item_guid 为最新条目，如果它与当前不同
-        # 这可以防止在源清空旧条目后，下次出现新条目时，last_known_guid 找不到匹配而推送所有条目
         if feed_data.entries and not is_test_run:
             latest_entry_guid = get_entry_guid(feed_data.entries[0])
             if sub['last_fetched_item_guid'] != latest_entry_guid:
@@ -436,17 +439,16 @@ def process_feed(subscription_id, is_test_run=False):
     elif is_test_run and new_items_to_notify:
         logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_guid 未更新。")
 
-    # 清理内存
     del feed_data
     gc.collect()
 
 # --- Gemini Summary Processing ---
 def generate_daily_summary():
-    config = get_summary_config()
-    if not config or not config['gemini_api_key']:
+    config_row = get_summary_config()
+    if not config_row or not config_row['gemini_api_key']:
         logger.warning("未配置 Gemini API Key，跳过每日总结。")
         return
-    if not config['summary_bark_key']:
+    if not config_row['summary_bark_key']:
         logger.warning("未配置总结 Bark Key，跳过每日总结通知。")
         return
     if not genai:
@@ -454,29 +456,30 @@ def generate_daily_summary():
         return
 
     titles = get_daily_feed_titles()
+    interval_hours = config_row['interval_hours'] if config_row['interval_hours'] is not None else 24
     if not titles:
-        logger.info(f"过去{config['interval_hours']}小时内没有新订阅标题，跳过总结。")
+        logger.info(f"过去{interval_hours}小时内没有新订阅标题，跳过总结。")
         return
 
     sub_titles = {}
-    for title_row in titles:
-        sub_name = title_row['name']
+    for title_row_item in titles:
+        sub_name = title_row_item['name']
         if sub_name not in sub_titles:
             sub_titles[sub_name] = []
-        sub_titles[sub_name].append(title_row['title'])
+        sub_titles[sub_name].append(title_row_item['title'])
 
-    prompt_template = config['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
+    prompt_template = config_row['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
     
     formatted_titles_list = []
-    for sub, sub_feed_titles in sub_titles.items():
-        formatted_titles_list.append(f"{sub}: {', '.join(sub_feed_titles)}")
+    for sub_name, sub_feed_titles in sub_titles.items():
+        formatted_titles_list.append(f"{sub_name}: {', '.join(sub_feed_titles)}")
     formatted_titles_string = "\n".join(formatted_titles_list)
     
     final_prompt = prompt_template.replace("{sub_titles}", formatted_titles_string)
 
     try:
-        genai.configure(api_key=config['gemini_api_key'])
-        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.0-flash'))
+        genai.configure(api_key=config_row['gemini_api_key'])
+        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest'))
         response = model.generate_content(final_prompt)
         summary_text = response.text
         logger.info("Gemini API 成功生成总结。")
@@ -484,7 +487,7 @@ def generate_daily_summary():
         save_summary_result(summary_text)
 
         success, response_data = send_bark_notification(
-            device_key=config['summary_bark_key'],
+            device_key=config_row['summary_bark_key'],
             title="每日RSS总结",
             body=summary_text[:2000],
             group="每日总结"
@@ -519,20 +522,20 @@ def schedule_feed_job(subscription):
             id=job_id,
             name=f"Check {subscription['name']}",
             replace_existing=True,
-            next_run_time=datetime.now(timezone.utc), # 立即运行一次
-            misfire_grace_time=60  # 允许任务延迟最多60秒执行，而不会报"missed"
+            next_run_time=datetime.now(timezone.utc),
+            misfire_grace_time=60
         )
         logger.info(f"已为 '{subscription['name']}' (ID: {subscription['id']}, Active: {subscription['is_active']}) 调度任务，间隔: {subscription['interval_minutes']} 分钟（带30秒jitter）。下次运行：ASAP")
     except Exception as e:
         logger.error(f"为 '{subscription['name']}' (ID: {subscription['id']}) 调度任务失败: {e}", exc_info=True)
 
 def schedule_summary_job():
-    config = get_summary_config()
-    if not config or not config['interval_hours']:
+    config_row = get_summary_config()
+    if not config_row or not config_row['interval_hours']:
         logger.info("未配置总结间隔或总结间隔为0，跳过总结任务调度。")
         return
-    if config['interval_hours'] < 1:
-        logger.warning(f"总结间隔配置为 {config['interval_hours']} 小时，至少应为1小时。跳过总结任务调度。")
+    if config_row['interval_hours'] < 1:
+        logger.warning(f"总结间隔配置为 {config_row['interval_hours']} 小时，至少应为1小时。跳过总结任务调度。")
         return
 
     job_id = "daily_summary"
@@ -546,13 +549,13 @@ def schedule_summary_job():
     try:
         scheduler.add_job(
             func=generate_daily_summary,
-            trigger=IntervalTrigger(hours=config['interval_hours'], timezone=BEIJING_TZ, jitter=30),
+            trigger=IntervalTrigger(hours=config_row['interval_hours'], timezone=BEIJING_TZ, jitter=30),
             id=job_id,
             name="Daily Summary",
             replace_existing=True,
             next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5)
         )
-        logger.info(f"已调度每日总结任务，每 {config['interval_hours']} 小时运行一次（带30秒jitter），下次运行：ASAP (approx. 5 mins from now)")
+        logger.info(f"已调度每日总结任务，每 {config_row['interval_hours']} 小时运行一次（带30秒jitter），下次运行：ASAP (approx. 5 mins from now)")
     except Exception as e:
         logger.error(f"调度每日总结任务失败: {e}", exc_info=True)
 
@@ -596,11 +599,8 @@ def reschedule_all_jobs():
             except Exception as e:
                 logger.error(f"移除旧任务 {job.id} 时发生错误: {e}", exc_info=True)
 
-    # 修改点：为所有订阅（无论是否激活）都调度任务
-    # process_feed 函数内部会根据 is_active 状态决定是否发送通知
     for sub in subscriptions:
-        schedule_feed_job(sub) # 不再检查 sub['is_active']
-        # logger.info(f"在 reschedule_all_jobs 中为 '{sub['name']}' (Active: {sub['is_active']}) 调度任务。")
+        schedule_feed_job(sub)
 
     schedule_summary_job()
     schedule_cleanup_job()
@@ -642,7 +642,7 @@ def add_subscription():
     if sub_id:
         new_sub = get_subscription_by_id(sub_id)
         if new_sub:
-            schedule_feed_job(new_sub) # 新增订阅时，它默认是 active 的
+            schedule_feed_job(new_sub)
             flash(f"订阅 '{name}' 添加成功并已调度。", 'success')
         else:
             flash(f"订阅 '{name}' 添加到数据库后无法立即检索。", 'error')
@@ -687,10 +687,14 @@ def update_subscription_action(sub_id):
         interval_minutes = int(interval_minutes_str)
         if interval_minutes < 1:
             flash('抓取间隔不能小于1分钟。', 'error')
+            current_form_data['interval_minutes'] = interval_minutes
             return render_template('edit_subscription.html', subscription=current_form_data)
     except ValueError:
         flash('抓取间隔必须是有效的数字。', 'error')
         return render_template('edit_subscription.html', subscription=current_form_data)
+    
+    current_form_data['interval_minutes'] = interval_minutes
+
 
     if url_new != original_sub['url']:
         try:
@@ -700,26 +704,23 @@ def update_subscription_action(sub_id):
                 ).fetchone()
                 if existing_sub_with_url:
                     flash(f"URL '{url_new}' 已被ID为 {existing_sub_with_url['id']} 的其他订阅使用。", 'error')
-                    current_form_data['interval_minutes'] = interval_minutes
                     return render_template('edit_subscription.html', subscription=current_form_data)
         except sqlite3.Error as e:
             logger.error(f"检查URL重复时发生数据库错误: {e}")
             flash("检查URL时发生数据库错误，请重试。", 'error')
-            current_form_data['interval_minutes'] = interval_minutes
             return render_template('edit_subscription.html', subscription=current_form_data)
 
     success_db_update = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key)
     
     if success_db_update:
-        updated_sub = get_subscription_by_id(sub_id) # is_active 状态不变
+        updated_sub = get_subscription_by_id(sub_id)
         if updated_sub:
-            schedule_feed_job(updated_sub) # 重新调度，会考虑其当前的 is_active 状态
+            schedule_feed_job(updated_sub)
             flash(f"订阅 '{name}' 更新成功并已重新调度。", 'success')
         else:
             flash(f"订阅 '{name}' 更新后无法从数据库重新加载。", 'error')
     else:
         flash(f"更新订阅 '{name}' 失败。请检查日志或确保URL唯一。", 'error')
-        current_form_data['interval_minutes'] = interval_minutes
         return render_template('edit_subscription.html', subscription=current_form_data)
             
     return redirect(url_for('index'))
@@ -749,7 +750,6 @@ def test_subscription(sub_id):
     if sub:
         flash(f"正在测试订阅 '{sub['name']}'... 请检查你的 Bark 设备。如果源有最新内容，将会收到带'[测试]'前缀的通知。", 'info')
         try:
-            # 测试运行时，process_feed 内部会忽略 is_active 状态强制发送通知
             process_feed(sub_id, is_test_run=True)
         except Exception as e:
             logger.error(f"测试订阅 {sub['name']} 时发生意外错误: {e}", exc_info=True)
@@ -767,11 +767,8 @@ def toggle_subscription_status(sub_id):
 
     new_status_bool = toggle_subscription_active_status_in_db(sub_id)
     if new_status_bool is not None:
-        toggled_sub = get_subscription_by_id(sub_id) # 获取更新后的订阅信息
+        toggled_sub = get_subscription_by_id(sub_id)
         if toggled_sub:
-            # 无论激活还是暂停，都重新调度。
-            # schedule_feed_job 会创建/更新任务。
-            # process_feed 会根据 toggled_sub['is_active'] 决定是否发送通知。
             schedule_feed_job(toggled_sub)
             status_text = "激活" if new_status_bool else "暂停"
             flash(f"订阅 '{toggled_sub['name']}' 已设置为 {status_text} 状态并重新调度。", 'success')
@@ -783,64 +780,104 @@ def toggle_subscription_status(sub_id):
 
 @app.route('/summary_config', methods=['GET', 'POST'])
 def summary_config():
-    if request.method == 'POST':
-        gemini_api_key = request.form.get('gemini_api_key', '').strip()
-        gemini_api_key_hidden = request.form.get('gemini_api_key_hidden', '').strip()
-        summary_prompt = request.form.get('summary_prompt', '').strip()
-        interval_hours_str = request.form.get('interval_hours', '24').strip()
-        summary_bark_key = request.form.get('summary_bark_key', '').strip()
-        summary_bark_key_hidden = request.form.get('summary_bark_key_hidden', '').strip()
-        
-        current_config_for_render = get_summary_config()
-        if not current_config_for_render:
-             current_config_for_render = {
-                'gemini_api_key': '', 'summary_prompt': '', 'interval_hours': 24, 
-                'summary_bark_key': '', 'last_summary': None, 'last_summary_at': None
-            }
+    db_config_row = get_summary_config()
+    
+    if db_config_row:
+        current_config_dict = dict(db_config_row)
+    else:
+        current_config_dict = {
+            'id': 1, 'gemini_api_key': None, 'summary_prompt': None, 
+            'interval_hours': 24, 'summary_bark_key': None, 
+            'last_summary': None, 'last_summary_at': None
+        }
 
-        if gemini_api_key == '********' or not gemini_api_key:
-            gemini_api_key = gemini_api_key_hidden
-        if summary_bark_key == '********' or not summary_bark_key:
-            summary_bark_key = summary_bark_key_hidden
+    if request.method == 'POST':
+        db_gemini_key = current_config_dict.get('gemini_api_key', '')
+        db_summary_bark_key = current_config_dict.get('summary_bark_key', '')
+
+        form_gemini_api_key_input = request.form.get('gemini_api_key', '').strip()
+        form_summary_bark_key_input = request.form.get('summary_bark_key', '').strip()
+        
+        form_gemini_api_key_hidden = request.form.get('gemini_api_key_hidden', '').strip()
+        form_summary_bark_key_hidden = request.form.get('summary_bark_key_hidden', '').strip()
+
+        if form_gemini_api_key_input == '********':
+            actual_gemini_api_key = form_gemini_api_key_hidden 
+        else:
+            actual_gemini_api_key = form_gemini_api_key_input
+
+        if form_summary_bark_key_input == '********':
+            actual_summary_bark_key = form_summary_bark_key_hidden
+        else:
+            actual_summary_bark_key = form_summary_bark_key_input
+        
+        summary_prompt_from_form = request.form.get('summary_prompt', '').strip()
+        interval_hours_str_from_form = request.form.get('interval_hours', '24').strip()
 
         try:
-            interval_hours = int(interval_hours_str)
-            if interval_hours < 1:
+            interval_hours_val = int(interval_hours_str_from_form)
+            if interval_hours_val < 1:
                 flash('总结间隔不能小于1小时。', 'error')
-                current_config_for_render.update({
-                    'gemini_api_key': gemini_api_key,
-                    'summary_prompt': summary_prompt,
-                    'interval_hours': interval_hours_str,
-                    'summary_bark_key': summary_bark_key
+                form_data_for_render = current_config_dict.copy()
+                form_data_for_render.update({
+                    'gemini_api_key': actual_gemini_api_key, 
+                    'summary_prompt': summary_prompt_from_form,
+                    'interval_hours': interval_hours_str_from_form,
+                    'summary_bark_key': actual_summary_bark_key
                 })
-                return render_template('summary_config.html', config=current_config_for_render)
+                return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False) # Added show_summary_area
         except ValueError:
             flash('总结间隔必须是有效的数字。', 'error')
-            current_config_for_render.update({
-                'gemini_api_key': gemini_api_key,
-                'summary_prompt': summary_prompt,
-                'interval_hours': interval_hours_str,
-                'summary_bark_key': summary_bark_key
+            form_data_for_render = current_config_dict.copy()
+            form_data_for_render.update({
+                'gemini_api_key': actual_gemini_api_key,
+                'summary_prompt': summary_prompt_from_form,
+                'interval_hours': interval_hours_str_from_form,
+                'summary_bark_key': actual_summary_bark_key
             })
-            return render_template('summary_config.html', config=current_config_for_render)
+            return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False) # Added show_summary_area
 
-        if update_summary_config(gemini_api_key, summary_prompt, interval_hours, summary_bark_key):
+        if update_summary_config(actual_gemini_api_key, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
             schedule_summary_job()
             flash('总结配置已更新并重新调度。', 'success')
         else:
             flash('更新总结配置失败，请检查日志。', 'error')
         return redirect(url_for('summary_config'))
 
-    config = get_summary_config()
-    return render_template('summary_config.html', config=config)
+    # --- GET Request Logic ---
+    feed_items_to_display = None 
+    show_items_area_flag = False
+    show_summary_area_flag = False # New flag for showing summary
+
+    if request.args.get('show_items', 'false').lower() == 'true':
+        show_items_area_flag = True
+        interval_hours_for_display = current_config_dict.get('interval_hours', 24)
+        if interval_hours_for_display is None:
+            interval_hours_for_display = 24
+            
+        feed_items_to_display = get_detailed_feed_items_for_summary(interval_hours_for_display)
+        if not feed_items_to_display:
+            flash(f"过去 {interval_hours_for_display} 小时内没有获取到任何 RSS 条目。", "info")
+    
+    if request.args.get('show_summary', 'false').lower() == 'true':
+        show_summary_area_flag = True
+        if not current_config_dict.get('last_summary'):
+            flash("数据库中还没有保存任何总结。", "info")
+            
+    return render_template('summary_config.html', 
+                           config=current_config_dict, 
+                           feed_items_for_summary=feed_items_to_display, 
+                           show_items_area=show_items_area_flag,
+                           show_summary_area=show_summary_area_flag) # Pass new flag
+
 
 @app.route('/test_summary')
 def test_summary():
-    config = get_summary_config()
-    if not config or not config['gemini_api_key']:
+    config_row = get_summary_config()
+    if not config_row or not config_row['gemini_api_key']:
         flash('未配置 Gemini API Key，无法测试总结。', 'error')
         return redirect(url_for('summary_config'))
-    if not config['summary_bark_key']:
+    if not config_row['summary_bark_key']:
         flash('未配置总结 Bark Key，无法测试总结通知。', 'error')
         return redirect(url_for('summary_config'))
     if not genai:
@@ -848,18 +885,19 @@ def test_summary():
         return redirect(url_for('summary_config'))
 
     titles = get_daily_feed_titles()
+    interval_hours = config_row['interval_hours'] if config_row['interval_hours'] is not None else 24
     if not titles:
-        flash(f'过去{config["interval_hours"]}小时内没有新订阅标题，无法生成测试总结。', 'info')
+        flash(f'过去{interval_hours}小时内没有新订阅标题，无法生成测试总结。', 'info')
         return redirect(url_for('summary_config'))
 
     sub_titles = {}
-    for title_row in titles:
-        sub_name = title_row['name']
+    for title_row_item in titles:
+        sub_name = title_row_item['name']
         if sub_name not in sub_titles:
             sub_titles[sub_name] = []
-        sub_titles[sub_name].append(title_row['title'])
+        sub_titles[sub_name].append(title_row_item['title'])
 
-    prompt_template = config['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
+    prompt_template = config_row['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
     
     formatted_titles_list = []
     for sub, sub_feed_titles in sub_titles.items():
@@ -870,31 +908,34 @@ def test_summary():
     logger.info(f"测试总结使用的最终提示词: {final_prompt[:500]}...")
 
     try:
-        genai.configure(api_key=config['gemini_api_key'])
-        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.0-flash'))
+        genai.configure(api_key=config_row['gemini_api_key'])
+        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest'))
         response = model.generate_content(final_prompt)
         summary_text = response.text
         logger.info("Gemini API 成功生成测试总结。")
         
-        save_summary_result(summary_text)
+        save_summary_result(summary_text) # Save test summary to DB to show on page
 
         success, response_data = send_bark_notification(
-            device_key=config['summary_bark_key'],
+            device_key=config_row['summary_bark_key'],
             title="[测试] 每日RSS总结",
             body=summary_text[:2000],
             group="每日总结"
         )
         if success:
             logger.info(f"测试总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
+            # Redirect to show_summary=true to display the newly saved test summary
             flash('测试总结已生成并发送，请检查Bark设备。总结结果已更新到页面。', 'success')
+            return redirect(url_for('summary_config', show_summary='true')) 
         else:
             logger.error(f"测试总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
             flash('测试总结通知发送失败，请检查日志。总结结果仍会更新到页面。', 'warning')
+            return redirect(url_for('summary_config', show_summary='true')) # Still show the saved summary
     except Exception as e:
         logger.error(f"测试总结失败: {e}", exc_info=True)
         flash(f"测试总结失败: {e}", 'error')
 
-    return redirect(url_for('summary_config'))
+    return redirect(url_for('summary_config')) # Fallback redirect
 
 # --- 应用初始化和启动 ---
 db_dir_path = os.path.dirname(DATABASE_FILE)
@@ -922,7 +963,7 @@ if not scheduler.running:
     try:
         scheduler.start(paused=False)
         logger.info("调度器已启动。")
-        reschedule_all_jobs() # 在这里调用，确保所有订阅都被考虑
+        reschedule_all_jobs()
     except Exception as e:
         logger.critical(f"调度器启动失败: {e}", exc_info=True)
 else:
