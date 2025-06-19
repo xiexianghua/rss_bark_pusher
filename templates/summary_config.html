@@ -8,7 +8,7 @@
 </head>
 <body class="bg-gray-100 font-sans">
     <div class="container mx-auto p-4">
-        <h1 class="text-2xl font-bold mb-4">📅 每日总结配置</h1>
+        <h1 class="text-2xl font-bold mb-4 text-gray-800">📅 每日总结配置</h1>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
@@ -25,10 +25,10 @@
         <form method="POST" action="{{ url_for('summary_config') }}" class="bg-white p-6 rounded shadow-md mb-6">
             <div class="mb-4">
                 <label for="gemini_api_key" class="block text-sm font-medium text-gray-700">Gemini API Key:</label>
-                <input type="text" name="gemini_api_key" id="gemini_api_key" 
-                       value="{{ '********' if config and config.gemini_api_key else '' }}" 
+                <input type="text" name="gemini_api_key" id="gemini_api_key"
+                       value="{{ '********' if config and config.gemini_api_key else '' }}"
                        placeholder="{{ '请输入 Gemini API Key' if not config or not config.gemini_api_key else '********' }}"
-                       class="mt-1 block w-full border border-gray-300 rounded p-2">
+                       class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
                 {% if config and config.gemini_api_key %}
                     <input type="hidden" name="gemini_api_key_hidden" value="{{ config.gemini_api_key }}">
                 {% endif %}
@@ -36,10 +36,10 @@
 
             <div class="mb-4">
                 <label for="summary_bark_key" class="block text-sm font-medium text-gray-700">总结通知 Bark Key:</label>
-                <input type="text" name="summary_bark_key" id="summary_bark_key" 
-                       value="{{ '********' if config and config.summary_bark_key else '' }}" 
+                <input type="text" name="summary_bark_key" id="summary_bark_key"
+                       value="{{ '********' if config and config.summary_bark_key else '' }}"
                        placeholder="{{ '请输入总结通知 Bark Key' if not config or not config.summary_bark_key else '********' }}"
-                       class="mt-1 block w-full border border-gray-300 rounded p-2">
+                       class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
                 {% if config and config.summary_bark_key %}
                     <input type="hidden" name="summary_bark_key_hidden" value="{{ config.summary_bark_key }}">
                 {% endif %}
@@ -47,29 +47,29 @@
 
             <div class="mb-4">
                 <label for="summary_prompt" class="block text-sm font-medium text-gray-700">总结提示词:</label>
-                <textarea name="summary_prompt" id="summary_prompt" rows="5" class="mt-1 block w-full border border-gray-300 rounded p-2">{{ config.summary_prompt if config and config.summary_prompt is not none else '请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}' }}</textarea>
+                <textarea name="summary_prompt" id="summary_prompt" rows="5" class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">{{ config.summary_prompt if config and config.summary_prompt is not none else '请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}' }}</textarea>
             </div>
 
             <div class="mb-4">
                 <label for="interval_hours" class="block text-sm font-medium text-gray-700">总结间隔 (小时):</label>
-                <input type="number" name="interval_hours" id="interval_hours" value="{{ config.interval_hours if config and config.interval_hours is not none else 24 }}" min="1" class="mt-1 block w-full border border-gray-300 rounded p-2">
+                <input type="number" name="interval_hours" id="interval_hours" value="{{ config.interval_hours if config and config.interval_hours is not none else 24 }}" min="1" class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
             </div>
 
             <div class="flex space-x-2">
-                <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">保存配置</button>
-                <a href="{{ url_for('index') }}" class="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600">返回主页</a>
+                <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50">保存配置</button>
+                <a href="{{ url_for('index') }}" class="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-opacity-50">返回主页</a>
             </div>
         </form>
 
-        <div class="mb-6 flex space-x-2">
-            <a href="{{ url_for('test_summary') }}" class="bg-purple-500 text-white px-4 py-2 rounded hover:bg-purple-600">测试总结</a>
-            <a href="{{ url_for('summary_config', show_items='true') }}" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600">显示条目</a>
-            <a href="{{ url_for('summary_config', show_summary='true') }}" class="bg-indigo-500 text-white px-4 py-2 rounded hover:bg-indigo-600">显示总结</a> {# 新增按钮 #}
+        <div class="mb-6 flex flex-wrap gap-2">
+            <a href="{{ url_for('test_summary') }}" class="bg-purple-500 text-white px-4 py-2 rounded hover:bg-purple-600 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-opacity-50">测试总结</a>
+            <a href="{{ url_for('summary_config', show_items='true') }}" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50">显示条目</a>
+            <a href="{{ url_for('summary_config', show_summary='true') }}" class="bg-indigo-500 text-white px-4 py-2 rounded hover:bg-indigo-600 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-50">显示总结</a>
         </div>
 
         {% if show_items_area %}
-            <div class="mt-8 bg-white p-6 rounded shadow-md">
-                <h2 class="text-xl font-semibold mb-4">
+            <div class="mt-8 bg-white p-4 md:p-6 rounded shadow-md">
+                <h2 class="text-xl font-semibold mb-4 text-gray-700">
                     过去 {{ (config.interval_hours if config and config.interval_hours is not none else 24) }} 小时内的 RSS 条目
                     {% if feed_items_for_summary is not none %}
                         ({{ feed_items_for_summary | length }} 条)
@@ -77,20 +77,29 @@
                 </h2>
                 {% if feed_items_for_summary %}
                     <div class="overflow-x-auto">
-                        <table class="min-w-full divide-y divide-gray-200">
-                            <thead class="bg-gray-50">
+                        <table class="min-w-full">
+                            <thead class="hidden md:table-header-group bg-gray-50">
                                 <tr>
                                     <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">订阅源</th>
                                     <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">条目标题</th>
                                     <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">获取时间 (北京)</th>
                                 </tr>
                             </thead>
-                            <tbody class="bg-white divide-y divide-gray-200">
+                            <tbody class="bg-white">
                                 {% for item in feed_items_for_summary %}
-                                <tr>
-                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.subscription_name }}</td>
-                                    <td class="px-6 py-4 whitespace-normal text-sm text-gray-900 break-all">{{ item.item_title }}</td>
-                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ item.fetched_at | beijing_time }}</td>
+                                <tr class="block md:table-row border border-gray-200 rounded shadow-sm mb-4 md:border-none md:shadow-none md:mb-0 md:border-b md:border-gray-200">
+                                    <td class="block md:table-cell px-4 py-2 md:px-6 md:py-4 whitespace-normal md:whitespace-nowrap">
+                                        <span class="font-semibold text-gray-600 md:hidden">订阅源: </span>
+                                        <span class="text-sm text-gray-900">{{ item.subscription_name }}</span>
+                                    </td>
+                                    <td class="block md:table-cell px-4 py-2 md:px-6 md:py-4 whitespace-normal break-all">
+                                        <span class="font-semibold text-gray-600 md:hidden">条目标题: </span>
+                                        <span class="text-sm text-gray-900">{{ item.item_title }}</span>
+                                    </td>
+                                    <td class="block md:table-cell px-4 py-2 md:px-6 md:py-4 whitespace-normal md:whitespace-nowrap">
+                                        <span class="font-semibold text-gray-600 md:hidden">获取时间 (北京): </span>
+                                        <span class="text-sm text-gray-500">{{ item.fetched_at | beijing_time }}</span>
+                                    </td>
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -102,14 +111,13 @@
             </div>
         {% endif %}
 
-        {# 修改: 上次总结结果的显示现在由 show_summary_area 控制 #}
         {% if show_summary_area %}
             <div class="bg-white p-6 rounded shadow-md mt-6">
                 {% if config and config.last_summary %}
-                    <h2 class="text-xl font-semibold mb-2">上次总结结果 ({{ config.last_summary_at | beijing_time }})</h2>
-                    <pre class="whitespace-pre-wrap text-sm">{{ config.last_summary }}</pre>
+                    <h2 class="text-xl font-semibold mb-2 text-gray-700">上次总结结果 ({{ config.last_summary_at | beijing_time }})</h2>
+                    <pre class="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded border border-gray-200">{{ config.last_summary }}</pre>
                 {% else %}
-                    <h2 class="text-xl font-semibold mb-2">上次总结结果</h2>
+                    <h2 class="text-xl font-semibold mb-2 text-gray-700">上次总结结果</h2>
                     <p class="text-gray-600">数据库中还没有保存任何总结。</p>
                 {% endif %}
             </div>

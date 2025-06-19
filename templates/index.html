@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-100 font-sans">
-    <div class="container mx-auto p-6">
+    <div class="container mx-auto p-4 md:p-6">
         <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">RSS 订阅 → Bark</h1>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -22,75 +22,97 @@
             {% endif %}
         {% endwith %}
 
-        <div class="flex justify-start items-center mb-6">
-            <a href="{{ url_for('summary_config') }}" class="text-blue-600 hover:text-blue-800 font-medium">配置每日总结</a>
+        <div class="mb-6 text-center md:text-left">
+            <a href="{{ url_for('summary_config') }}" class="inline-block bg-indigo-500 text-white px-4 py-2 rounded-md hover:bg-indigo-600 font-medium text-sm shadow-sm">⚙️ 配置每日总结</a>
         </div>
 
-        <div id="add-subscription" class="bg-white p-6 rounded-lg shadow-md mb-6">
+        <div id="add-subscription" class="bg-white p-6 rounded-lg shadow-md mb-8">
             <h2 class="text-2xl font-semibold text-gray-800 mb-4">➕ 添加新订阅</h2>
             <form method="POST" action="{{ url_for('add_subscription') }}">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                     <div>
-                        <label class="block text-gray-700 font-medium mb-2" for="name">订阅名称:</label>
-                        <input type="text" id="name" name="name" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                        <label class="block text-gray-700 font-medium mb-1" for="name">订阅名称:</label>
+                        <input type="text" id="name" name="name" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                     </div>
                     <div>
-                        <label class="block text-gray-700 font-medium mb-2" for="url">RSS/Atom 链接:</label>
-                        <input type="url" id="url" name="url" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                        <label class="block text-gray-700 font-medium mb-1" for="url">RSS/Atom 链接:</label>
+                        <input type="url" id="url" name="url" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                     </div>
                     <div>
-                        <label class="block text-gray-700 font-medium mb-2" for="interval_minutes">抓取间隔 (分钟):</label>
-                        <input type="number" id="interval_minutes" name="interval_minutes" value="60" min="1" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                        <label class="block text-gray-700 font-medium mb-1" for="interval_minutes">抓取间隔 (分钟):</label>
+                        <input type="number" id="interval_minutes" name="interval_minutes" value="60" min="1" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                     </div>
                     <div>
-                        <label class="block text-gray-700 font-medium mb-2" for="bark_key">Bark Key:</label>
-                        <input type="text" id="bark_key" name="bark_key" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
+                        <label class="block text-gray-700 font-medium mb-1" for="bark_key">Bark Key:</label>
+                        <input type="text" id="bark_key" name="bark_key" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                     </div>
                 </div>
-                <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">添加订阅</button>
+                <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50">添加订阅</button>
             </form>
         </div>
 
         <h2 class="text-2xl font-semibold text-gray-800 mb-4">📋 当前订阅</h2>
 
         {% if subscriptions %}
-            <div class="bg-white rounded-lg shadow-md overflow-x-auto">
+            <div class="md:bg-white md:rounded-lg md:shadow-md overflow-x-auto">
                 <table class="w-full text-left">
-                    <thead>
+                    <thead class="hidden md:table-header-group">
                         <tr class="bg-gray-200">
-                            <th class="p-3">ID</th>
-                            <th class="p-3">名称</th>
-                            <th class="p-3">URL</th>
-                            <th class="p-3">间隔(分)</th>
-                            <th class="p-3">Bark Key (部分)</th>
-                            <th class="p-3">上次检查</th>
-                            <th class="p-3">状态</th>
-                            <th class="p-3">操作</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">ID</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">名称</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">URL</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">间隔(分)</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">Bark Key (部分)</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">上次检查</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">状态</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">操作</th>
                         </tr>
                     </thead>
-                    <tbody>
+                    <tbody class="block md:table-row-group">
                         {% for sub in subscriptions %}
-                            <tr class="border-t">
-                                <td class="p-3">{{ sub.id }}</td>
-                                <td class="p-3">{{ sub.name }}</td>
-                                <td class="p-3">{{ sub.url[:40] }}{{ '...' if sub.url|length > 40 else '' }}</td>
-                                <td class="p-3">{{ sub.interval_minutes }}</td>
-                                <td class="p-3">{{ sub.bark_key[:8] }}...</td>
-                                <td class="p-3">{{ sub.last_checked_at | beijing_time }}</td>
-                                <td class="p-3">
+                            <tr class="block md:table-row bg-white rounded-lg shadow-md mb-6 md:bg-transparent md:shadow-none md:mb-0 md:border-b md:border-gray-200">
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">ID: </span>
+                                    <span class="text-sm text-gray-900">{{ sub.id }}</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">名称: </span>
+                                    <span class="text-sm text-gray-900">{{ sub.name }}</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100 break-all">
+                                    <span class="font-semibold text-gray-600 md:hidden">URL: </span>
+                                    <span class="text-sm text-gray-900">{{ sub.url[:40] }}{{ '...' if sub.url|length > 40 else '' }}</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">间隔(分): </span>
+                                    <span class="text-sm text-gray-900">{{ sub.interval_minutes }}</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">Bark Key (部分): </span>
+                                    <span class="text-sm text-gray-900">{{ sub.bark_key[:8] }}...</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">上次检查: </span>
+                                    <span class="text-sm text-gray-500">{{ sub.last_checked_at | beijing_time if sub.last_checked_at else '从未' }}</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">状态: </span>
                                     {% if sub.is_active %}
-                                        <span class="text-green-600 font-medium">活动 (推送开启)</span>
+                                        <span class="text-sm text-green-600 font-medium">活动 (推送开启)</span>
                                     {% else %}
-                                        <span class="text-red-600 font-medium">暂停 (推送关闭)</span>
+                                        <span class="text-sm text-red-600 font-medium">暂停 (推送关闭)</span>
                                     {% endif %}
                                 </td>
-                                <td class="p-3 flex space-x-2">
-                                    <a href="{{ url_for('edit_subscription_page', sub_id=sub.id) }}" class="text-blue-600 hover:text-blue-800">编辑</a>
-                                    <a href="{{ url_for('test_subscription', sub_id=sub.id) }}" class="text-blue-600 hover:text-blue-800">测试</a>
-                                    <a href="{{ url_for('toggle_subscription_status', sub_id=sub.id) }}" class="text-blue-600 hover:text-blue-800">
-                                        {% if sub.is_active %}暂停推送{% else %}激活推送{% endif %} {# 修改: 按钮文本 #}
-                                    </a>
-                                    <a href="{{ url_for('delete_subscription', sub_id=sub.id) }}" class="text-red-600 hover:text-red-800" onclick="return confirm('确定要删除订阅 {{ sub.name }} 吗？');">删除</a>
+                                <td class="block md:table-cell p-3">
+                                    <span class="font-semibold text-gray-600 md:hidden">操作: </span>
+                                    <div class="flex flex-wrap gap-2 mt-1 md:mt-0">
+                                        <a href="{{ url_for('edit_subscription_page', sub_id=sub.id) }}" class="text-blue-600 hover:text-blue-800 text-sm">编辑</a>
+                                        <a href="{{ url_for('test_subscription', sub_id=sub.id) }}" class="text-green-600 hover:text-green-800 text-sm">测试</a>
+                                        <a href="{{ url_for('toggle_subscription_status', sub_id=sub.id) }}" class="text-yellow-600 hover:text-yellow-800 text-sm">
+                                            {% if sub.is_active %}暂停推送{% else %}激活推送{% endif %}
+                                        </a>
+                                        <a href="{{ url_for('delete_subscription', sub_id=sub.id) }}" class="text-red-600 hover:text-red-800 text-sm" onclick="return confirm('确定要删除订阅 \'{{ sub.name }}\' 吗？');">删除</a>
+                                    </div>
                                 </td>
                             </tr>
                         {% endfor %}
