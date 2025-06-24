@@ -115,7 +115,47 @@ def get_db_connection(timeout_seconds=30):
             except Exception as e:
                 logger.error(f"关闭数据库连接时出错: {e}")
 
-def cleanup_old_feed_items(days=1):  # 缩短到 1 天
+# --- 关键词触发器相关函数 ---
+def get_all_keyword_triggers():
+    """获取所有关键词触发器"""
+    try:
+        with get_db_connection() as conn:
+            triggers = conn.execute("SELECT * FROM keyword_triggers ORDER BY created_at DESC").fetchall()
+            return triggers
+    except sqlite3.Error as e:
+        logger.error(f"获取所有关键词触发器时发生数据库错误: {e}")
+        return []
+
+def add_keyword_trigger(keyword, bark_key):
+    """添加一个新的关键词触发器"""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO keyword_triggers (keyword, bark_key, created_at) VALUES (?, ?, ?)",
+                (keyword, bark_key, datetime.now(timezone.utc))
+            )
+            conn.commit()
+            return True
+    except sqlite3.IntegrityError:
+        logger.warning(f"尝试添加已存在的关键词: {keyword}")
+        return False
+    except sqlite3.Error as e:
+        logger.error(f"添加关键词 {keyword} 时发生数据库错误: {e}")
+        return False
+
+def delete_keyword_trigger(keyword_id):
+    """根据ID删除一个关键词触发器"""
+    try:
+        with get_db_connection() as conn:
+            result = conn.execute("DELETE FROM keyword_triggers WHERE id = ?", (keyword_id,))
+            conn.commit()
+            return result.rowcount > 0
+    except sqlite3.Error as e:
+        logger.error(f"删除关键词ID {keyword_id} 时发生数据库错误: {e}")
+        return False
+
+# --- 其他数据库函数 ---
+def cleanup_old_feed_items(days=1):
     try:
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
@@ -132,7 +172,6 @@ def cleanup_old_feed_items(days=1):  # 缩短到 1 天
         return 0
 
 def _add_column_if_not_exists(conn, table_name, column_name, column_type):
-    """辅助函数：如果列不存在，则向表中添加列"""
     cursor = conn.execute(f"PRAGMA table_info({table_name})")
     columns = [row['name'] for row in cursor.fetchall()]
     if column_name not in columns:
@@ -219,6 +258,17 @@ def init_db():
                     last_summary_at TIMESTAMP
                 )
             ''')
+            
+            # [新增] 创建 keyword_triggers 表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS keyword_triggers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL UNIQUE,
+                    bark_key TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_keyword_triggers_keyword ON keyword_triggers(keyword);")
 
             logger.info("正在检查并迁移 summary_config 表结构...")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
@@ -255,10 +305,6 @@ def init_db():
                 conn.close()
 
 def get_detailed_feed_items_for_summary(interval_hours):
-    """
-    获取在指定总结时间间隔内的详细 RSS 条目信息。
-    返回一个包含订阅源名称、条目标题、GUID 和获取时间的条目列表，按获取时间降序排列。
-    """
     try:
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
@@ -277,7 +323,7 @@ def get_detailed_feed_items_for_summary(interval_hours):
         return []
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s') # Changed to INFO for more output
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
     logger.info("直接运行 database.py 进行测试...")
     
     test_db_file = os.path.join(os.path.dirname(DATABASE_FILE), "test_subscriptions.db")

@@ -22,8 +22,10 @@
             {% endif %}
         {% endwith %}
 
-        <div class="mb-6 text-center md:text-left">
+        <!-- [修改] 添加了关键词配置按钮 -->
+        <div class="mb-6 text-center md:text-left flex flex-wrap gap-2">
             <a href="{{ url_for('summary_config') }}" class="inline-block bg-indigo-500 text-white px-4 py-2 rounded-md hover:bg-indigo-600 font-medium text-sm shadow-sm">⚙️ 配置每日总结</a>
+            <a href="{{ url_for('keywords') }}" class="inline-block bg-yellow-500 text-white px-4 py-2 rounded-md hover:bg-yellow-600 font-medium text-sm shadow-sm">🔑 配置关键词触发</a>
         </div>
 
         <div id="add-subscription" class="bg-white p-6 rounded-lg shadow-md mb-8">
@@ -100,7 +102,7 @@
                                     {% if sub.is_active %}
                                         <span class="text-sm text-green-600 font-medium">活动 (推送开启)</span>
                                     {% else %}
-                                        <span class="text-sm text-red-600 font-medium">暂停 (推送关闭)</span>
+                                        <span class="text-sm text-red-600 font-medium">暂停 (关键词触发)</span>
                                     {% endif %}
                                 </td>
                                 <td class="block md:table-cell p-3">

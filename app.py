@@ -30,7 +30,8 @@ except ImportError:
 
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
-    get_detailed_feed_items_for_summary
+    get_detailed_feed_items_for_summary,
+    get_all_keyword_triggers, add_keyword_trigger, delete_keyword_trigger
 )
 
 
@@ -89,7 +90,7 @@ scheduler = BackgroundScheduler(
     executors={'default': {'type': 'threadpool', 'max_workers': 3}}
 )
 
-# --- 数据库操作函数 ---
+# --- 数据库操作函数 (订阅相关) ---
 def add_sub_to_db(name, url, interval_minutes, bark_key):
     try:
         with get_db_connection() as conn:
@@ -196,6 +197,7 @@ def update_subscription_details_in_db(sub_id, name, url, interval_minutes, bark_
         logger.error(f"更新订阅 {sub_id} 时发生数据库错误: {e}")
         return False
 
+# --- 数据库操作函数 (总结相关) ---
 def get_summary_config():
     try:
         with get_db_connection() as conn:
@@ -263,14 +265,17 @@ def get_daily_feed_titles():
 # --- RSS Processing and Bark Notification ---
 async def fetch_feed_content(url, sub_id):
     headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub_id})'}
-    async with aiohttp.ClientSession() as session:
+    # [修复] 使用 aiohttp.ClientTimeout 正确配置超时
+    timeout_config = aiohttp.ClientTimeout(total=FEED_REQUEST_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
-            async with session.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT) as response:
+            async with session.get(url, headers=headers) as response:
                 response.raise_for_status()
                 content = await response.read()
                 logger.debug(f"成功获取订阅内容，字节数: {len(content)}")
                 return content
-        except aiohttp.ClientTimeout:
+        # [修复] 捕获正确的 asyncio.TimeoutError
+        except asyncio.TimeoutError:
             logger.error(f"抓取订阅 {url} 超时 (超过 {FEED_REQUEST_TIMEOUT} 秒)。")
             return None
         except aiohttp.ClientResponseError as e:
@@ -323,40 +328,75 @@ def process_feed(subscription_id, is_test_run=False):
     except sqlite3.Error as e:
         logger.error(f"保存订阅 {sub['name']} 的条目到数据库时出错: {e}")
 
+    last_known_guid = sub['last_fetched_item_guid']
+    temp_new_items = []
+    if not last_known_guid and not is_test_run:
+        if feed_data.entries:
+            temp_new_items.append(feed_data.entries[0])
+            logger.info(f"首次运行 {sub['name']}, 标记最新条目: {feed_data.entries[0].get('title', '无标题')}")
+    else:
+        for entry in feed_data.entries:
+            entry_guid = get_entry_guid(entry)
+            if entry_guid == last_known_guid:
+                break
+            temp_new_items.append(entry)
+    new_items_to_notify = list(reversed(temp_new_items))
+
     if not sub['is_active'] and not is_test_run:
-        logger.info(f"订阅 {sub['name']} 未激活，跳过Bark通知，但已保存条目用于总结。")
+        logger.info(f"订阅 {sub['name']} 未激活，开始检查关键词触发。")
+        keyword_triggers = get_all_keyword_triggers()
+        
+        if new_items_to_notify and keyword_triggers:
+            notified_guids_this_run = set()
+            for item in new_items_to_notify:
+                item_title = item.get('title', '无标题')
+                item_guid = get_entry_guid(item)
+                
+                if item_guid in notified_guids_this_run:
+                    continue
+
+                for trigger in keyword_triggers:
+                    keyword = trigger['keyword']
+                    if keyword.lower() in item_title.lower():
+                        logger.info(f"关键词 '{keyword}' 命中: 订阅='{sub['name']}', 标题='{item_title}'")
+                        
+                        link = item.get('link', '')
+                        raw_summary = item.get('summary', item.get('description', item_title))
+                        soup = BeautifulSoup(raw_summary, "html.parser")
+                        body_content = soup.get_text(separator=' ', strip=True)
+                        
+                        notification_title = f"[关键词: {keyword}] {sub['name']}: {item_title}"
+                        
+                        send_bark_notification(
+                            device_key=trigger['bark_key'],
+                            title=notification_title,
+                            body=body_content[:500],
+                            url=link if link else None,
+                            group=f"关键词-{sub['name']}"
+                        )
+                        notified_guids_this_run.add(item_guid)
+                        break 
+        
         if feed_data.entries:
             latest_entry_guid = get_entry_guid(feed_data.entries[0])
             if sub['last_fetched_item_guid'] != latest_entry_guid:
                  update_subscription_last_item(sub['id'], latest_entry_guid)
-                 logger.info(f"非激活订阅 {sub['name']} 更新了 last_fetched_item_guid 为: {latest_entry_guid} (用于防止激活后推送旧内容)")
+                 logger.info(f"非激活订阅 {sub['name']} 更新了 last_fetched_item_guid 为: {latest_entry_guid}")
         return
 
-    last_known_guid = sub['last_fetched_item_guid']
-    new_items_to_notify = []
-
+    items_for_active_or_test = []
     if is_test_run:
         if feed_data.entries:
-            new_items_to_notify.append(feed_data.entries[0])
+            items_for_active_or_test.append(feed_data.entries[0])
             logger.info(f"[测试模式] 为 {sub['name']} 准备推送最新条目: {feed_data.entries[0].get('title', '无标题')}")
         else:
             logger.info(f"[测试模式] 订阅 {sub['name']} 没有条目可供测试。")
             return
     else:
-        temp_new_items = []
-        if not last_known_guid:
-            if feed_data.entries:
-                temp_new_items.append(feed_data.entries[0])
-                logger.info(f"首次运行 {sub['name']}, 标记最新条目: {feed_data.entries[0].get('title', '无标题')}")
-        else:
-            for entry in feed_data.entries:
-                entry_guid = get_entry_guid(entry)
-                if entry_guid == last_known_guid:
-                    break
-                temp_new_items.append(entry)
-        new_items_to_notify = list(reversed(temp_new_items))
+        items_for_active_or_test = new_items_to_notify
 
-    if not new_items_to_notify:
+
+    if not items_for_active_or_test:
         logger.info(f"订阅 {sub['name']} 没有新内容。")
         if feed_data.entries and not is_test_run:
             latest_entry_guid = get_entry_guid(feed_data.entries[0])
@@ -369,8 +409,8 @@ def process_feed(subscription_id, is_test_run=False):
     effective_title_prefix = "[测试] " if is_test_run else ""
     success_flag = False
 
-    if len(new_items_to_notify) == 1:
-        item = new_items_to_notify[0]
+    if len(items_for_active_or_test) == 1:
+        item = items_for_active_or_test[0]
         title = item.get('title', '无标题')
         link = item.get('link', '')
         raw_summary = item.get('summary', item.get('description', title))
@@ -394,13 +434,13 @@ def process_feed(subscription_id, is_test_run=False):
         else:
             logger.error(f"Bark 通知发送失败 for '{title}'. 错误: {response_data.get('message', '未知错误')}")
 
-    elif len(new_items_to_notify) > 1:
-        num_new_items = len(new_items_to_notify)
+    elif len(items_for_active_or_test) > 1:
+        num_new_items = len(items_for_active_or_test)
         aggregated_title = f"{effective_title_prefix}{sub['name']} 有 {num_new_items} 条新更新"
         aggregated_body_titles_part = []
         aggregated_body_links_part = []
 
-        for i, item in enumerate(new_items_to_notify):
+        for i, item in enumerate(items_for_active_or_test):
             item_title = item.get('title', '无标题')
             item_link = item.get('link', '')
             aggregated_body_titles_part.append(f"{i+1}. {item_title}")
@@ -414,7 +454,7 @@ def process_feed(subscription_id, is_test_run=False):
             aggregated_body += "\n---\n"
             aggregated_body += "\n".join(aggregated_body_links_part)
         
-        primary_url_for_notification = new_items_to_notify[-1].get('link', sub['url'])
+        primary_url_for_notification = items_for_active_or_test[-1].get('link', sub['url'])
 
         logger.info(f"准备发送 Bark 通知 (聚合 {num_new_items} 条目): Feed='{sub['name']}' (Test: {is_test_run})")
         success_flag, response_data = send_bark_notification(
@@ -428,7 +468,7 @@ def process_feed(subscription_id, is_test_run=False):
         if success_flag:
             logger.info(f"聚合 Bark 通知发送成功 for {num_new_items} items from '{sub['name']}'. Message ID: {response_data.get('messageid', 'N/A')}")
             if not is_test_run:
-                latest_item_in_batch = new_items_to_notify[-1]
+                latest_item_in_batch = items_for_active_or_test[-1]
                 latest_sent_guid_this_run = get_entry_guid(latest_item_in_batch)
         else:
             logger.error(f"聚合 Bark 通知发送失败 for '{sub['name']}'. 错误: {response_data.get('message', '未知错误')}")
@@ -436,11 +476,12 @@ def process_feed(subscription_id, is_test_run=False):
     if latest_sent_guid_this_run and not is_test_run:
         update_subscription_last_item(sub['id'], latest_sent_guid_this_run)
         logger.info(f"更新订阅 {sub['name']} 的 last_fetched_item_guid 为: {latest_sent_guid_this_run}")
-    elif is_test_run and new_items_to_notify:
+    elif is_test_run and items_for_active_or_test:
         logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_guid 未更新。")
 
     del feed_data
     gc.collect()
+
 
 # --- Gemini Summary Processing ---
 def generate_daily_summary():
@@ -778,6 +819,32 @@ def toggle_subscription_status(sub_id):
         flash(f"无法更改订阅 '{sub_before_toggle['name']}' 的状态。请检查日志。", 'error')
     return redirect(url_for('index'))
 
+@app.route('/keywords', methods=['GET', 'POST'])
+def keywords():
+    if request.method == 'POST':
+        keyword = request.form.get('keyword', '').strip()
+        bark_key = request.form.get('bark_key', '').strip()
+
+        if not keyword or not bark_key:
+            flash('关键词和 Bark Key 不能为空。', 'error')
+        else:
+            if add_keyword_trigger(keyword, bark_key):
+                flash(f"关键词 '{keyword}' 添加成功。", 'success')
+            else:
+                flash(f"添加关键词 '{keyword}' 失败，可能已存在。", 'error')
+        return redirect(url_for('keywords'))
+
+    triggers = get_all_keyword_triggers()
+    return render_template('keywords.html', triggers=triggers)
+
+@app.route('/keywords/delete/<int:keyword_id>')
+def delete_keyword(keyword_id):
+    if delete_keyword_trigger(keyword_id):
+        flash('关键词已删除。', 'success')
+    else:
+        flash('删除关键词失败，请检查日志。', 'error')
+    return redirect(url_for('keywords'))
+
 @app.route('/summary_config', methods=['GET', 'POST'])
 def summary_config():
     db_config_row = get_summary_config()
@@ -825,7 +892,7 @@ def summary_config():
                     'interval_hours': interval_hours_str_from_form,
                     'summary_bark_key': actual_summary_bark_key
                 })
-                return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False) # Added show_summary_area
+                return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False)
         except ValueError:
             flash('总结间隔必须是有效的数字。', 'error')
             form_data_for_render = current_config_dict.copy()
@@ -835,7 +902,7 @@ def summary_config():
                 'interval_hours': interval_hours_str_from_form,
                 'summary_bark_key': actual_summary_bark_key
             })
-            return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False) # Added show_summary_area
+            return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False)
 
         if update_summary_config(actual_gemini_api_key, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
             schedule_summary_job()
@@ -847,7 +914,7 @@ def summary_config():
     # --- GET Request Logic ---
     feed_items_to_display = None 
     show_items_area_flag = False
-    show_summary_area_flag = False # New flag for showing summary
+    show_summary_area_flag = False
 
     if request.args.get('show_items', 'false').lower() == 'true':
         show_items_area_flag = True
@@ -868,7 +935,7 @@ def summary_config():
                            config=current_config_dict, 
                            feed_items_for_summary=feed_items_to_display, 
                            show_items_area=show_items_area_flag,
-                           show_summary_area=show_summary_area_flag) # Pass new flag
+                           show_summary_area=show_summary_area_flag)
 
 
 @app.route('/test_summary')
@@ -914,7 +981,7 @@ def test_summary():
         summary_text = response.text
         logger.info("Gemini API 成功生成测试总结。")
         
-        save_summary_result(summary_text) # Save test summary to DB to show on page
+        save_summary_result(summary_text)
 
         success, response_data = send_bark_notification(
             device_key=config_row['summary_bark_key'],
@@ -924,18 +991,17 @@ def test_summary():
         )
         if success:
             logger.info(f"测试总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
-            # Redirect to show_summary=true to display the newly saved test summary
             flash('测试总结已生成并发送，请检查Bark设备。总结结果已更新到页面。', 'success')
             return redirect(url_for('summary_config', show_summary='true')) 
         else:
             logger.error(f"测试总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
             flash('测试总结通知发送失败，请检查日志。总结结果仍会更新到页面。', 'warning')
-            return redirect(url_for('summary_config', show_summary='true')) # Still show the saved summary
+            return redirect(url_for('summary_config', show_summary='true'))
     except Exception as e:
         logger.error(f"测试总结失败: {e}", exc_info=True)
         flash(f"测试总结失败: {e}", 'error')
 
-    return redirect(url_for('summary_config')) # Fallback redirect
+    return redirect(url_for('summary_config'))
 
 # --- 应用初始化和启动 ---
 db_dir_path = os.path.dirname(DATABASE_FILE)
