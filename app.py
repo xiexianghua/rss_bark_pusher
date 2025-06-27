@@ -23,17 +23,18 @@ except ImportError:
         return True, {"messageid": "dummy_id", "code": 200, "message": "Dummy success"}
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except ImportError:
-    print("错误: 无法导入 google-generativeai。请确保已安装：pip install -q -U google-generativeai")
+    print("错误: 无法导入 google.genai。请确保已安装：pip install -q -U google-genai ")
     genai = None
+    types = None
 
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
     get_detailed_feed_items_for_summary,
     get_all_keyword_triggers, add_keyword_trigger, delete_keyword_trigger
 )
-
 
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY', os.urandom(24))
 FEED_REQUEST_TIMEOUT = int(os.environ.get('FEED_REQUEST_TIMEOUT', 20))
@@ -265,7 +266,6 @@ def get_daily_feed_titles():
 # --- RSS Processing and Bark Notification ---
 async def fetch_feed_content(url, sub_id):
     headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub_id})'}
-    # [修复] 使用 aiohttp.ClientTimeout 正确配置超时
     timeout_config = aiohttp.ClientTimeout(total=FEED_REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
@@ -274,7 +274,6 @@ async def fetch_feed_content(url, sub_id):
                 content = await response.read()
                 logger.debug(f"成功获取订阅内容，字节数: {len(content)}")
                 return content
-        # [修复] 捕获正确的 asyncio.TimeoutError
         except asyncio.TimeoutError:
             logger.error(f"抓取订阅 {url} 超时 (超过 {FEED_REQUEST_TIMEOUT} 秒)。")
             return None
@@ -395,7 +394,6 @@ def process_feed(subscription_id, is_test_run=False):
     else:
         items_for_active_or_test = new_items_to_notify
 
-
     if not items_for_active_or_test:
         logger.info(f"订阅 {sub['name']} 没有新内容。")
         if feed_data.entries and not is_test_run:
@@ -482,7 +480,6 @@ def process_feed(subscription_id, is_test_run=False):
     del feed_data
     gc.collect()
 
-
 # --- Gemini Summary Processing ---
 def generate_daily_summary():
     config_row = get_summary_config()
@@ -492,7 +489,7 @@ def generate_daily_summary():
     if not config_row['summary_bark_key']:
         logger.warning("未配置总结 Bark Key，跳过每日总结通知。")
         return
-    if not genai:
+    if not genai or not types:
         logger.error("Gemini 库未加载，无法生成总结。")
         return
 
@@ -519,9 +516,14 @@ def generate_daily_summary():
     final_prompt = prompt_template.replace("{sub_titles}", formatted_titles_string)
 
     try:
-        genai.configure(api_key=config_row['gemini_api_key'])
-        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest'))
-        response = model.generate_content(final_prompt)
+        client = genai.Client(api_key=config_row['gemini_api_key'])
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config = types.GenerateContentConfig(tools=[grounding_tool])
+        response = client.models.generate_content(
+            model=os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash'),
+            contents=final_prompt,
+            config=config,
+        )
         summary_text = response.text
         logger.info("Gemini API 成功生成总结。")
 
@@ -647,7 +649,6 @@ def reschedule_all_jobs():
     schedule_cleanup_job()
     logger.info("所有任务重新调度完成。")
 
-
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
 def index():
@@ -735,7 +736,6 @@ def update_subscription_action(sub_id):
         return render_template('edit_subscription.html', subscription=current_form_data)
     
     current_form_data['interval_minutes'] = interval_minutes
-
 
     if url_new != original_sub['url']:
         try:
@@ -911,7 +911,6 @@ def summary_config():
             flash('更新总结配置失败，请检查日志。', 'error')
         return redirect(url_for('summary_config'))
 
-    # --- GET Request Logic ---
     feed_items_to_display = None 
     show_items_area_flag = False
     show_summary_area_flag = False
@@ -937,7 +936,6 @@ def summary_config():
                            show_items_area=show_items_area_flag,
                            show_summary_area=show_summary_area_flag)
 
-
 @app.route('/test_summary')
 def test_summary():
     config_row = get_summary_config()
@@ -947,7 +945,7 @@ def test_summary():
     if not config_row['summary_bark_key']:
         flash('未配置总结 Bark Key，无法测试总结通知。', 'error')
         return redirect(url_for('summary_config'))
-    if not genai:
+    if not genai or not types:
         flash("Gemini 库未加载，无法测试总结。", "error")
         return redirect(url_for('summary_config'))
 
@@ -975,9 +973,14 @@ def test_summary():
     logger.info(f"测试总结使用的最终提示词: {final_prompt[:500]}...")
 
     try:
-        genai.configure(api_key=config_row['gemini_api_key'])
-        model = genai.GenerativeModel(os.environ.get('GEMINI_MODEL_NAME', 'gemini-1.5-flash-latest'))
-        response = model.generate_content(final_prompt)
+        client = genai.Client(api_key=config_row['gemini_api_key'])
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config = types.GenerateContentConfig(tools=[grounding_tool])
+        response = client.models.generate_content(
+            model=os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash'),
+            contents=final_prompt,
+            config=config,
+        )
         summary_text = response.text
         logger.info("Gemini API 成功生成测试总结。")
         

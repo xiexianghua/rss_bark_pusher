@@ -4,4 +4,5 @@ requests
 APScheduler
 beautifulsoup4
 gunicorn
-google-generativeai
+google-genai 
+aiohttp
