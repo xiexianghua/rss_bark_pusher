@@ -371,6 +371,7 @@ def process_feed(subscription_id, is_test_run=False):
                             title=notification_title,
                             body=body_content[:500],
                             url=link if link else None,
+                            sound="glass",
                             group=f"关键词-{sub['name']}"
                         )
                         notified_guids_this_run.add(item_guid)
@@ -422,6 +423,7 @@ def process_feed(subscription_id, is_test_run=False):
             title=effective_title,
             body=body_content[:500],
             url=link if link else None,
+            sound="glass",
             group=sub['name']
         )
 
@@ -460,6 +462,7 @@ def process_feed(subscription_id, is_test_run=False):
             title=aggregated_title,
             body=aggregated_body[:2000],
             url=primary_url_for_notification,
+            sound="glass",
             group=sub['name']
         )
 
@@ -533,6 +536,7 @@ def generate_daily_summary():
             device_key=config_row['summary_bark_key'],
             title="每日RSS总结",
             body=summary_text[:2000],
+            sound="glass",
             group="每日总结"
         )
         if success:
@@ -990,6 +994,7 @@ def test_summary():
             device_key=config_row['summary_bark_key'],
             title="[测试] 每日RSS总结",
             body=summary_text[:2000],
+            sound="glass",
             group="每日总结"
         )
         if success:
