@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置 MQTT 服务器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4 md:p-6">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">🔌 配置 MQTT 服务器</h1>
+
+        <div class="bg-white p-6 rounded-lg shadow-md max-w-2xl mx-auto">
+            <form method="POST" action="{{ url_for('mqtt_config') }}">
+                <div class="space-y-6">
+                    <!-- MQTT Enabled -->
+                    <div class="flex items-center">
+                        <input type="checkbox" id="mqtt_enabled" name="mqtt_enabled" class="h-5 w-5 text-blue-600 focus:ring-blue-500 border-gray-300 rounded" {% if config.enabled %}checked{% endif %}>
+                        <label for="mqtt_enabled" class="ml-3 block text-lg font-medium text-gray-800">启用 MQTT 推送</label>
+                    </div>
+
+                    <!-- MQTT Server Details -->
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-gray-700 font-medium mb-1" for="mqtt_host">MQTT 主机:</label>
+                            <input type="text" id="mqtt_host" name="mqtt_host" value="{{ config.host or '' }}" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="例如: mqtt.example.com">
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 font-medium mb-1" for="mqtt_port">MQTT 端口:</label>
+                            <input type="number" id="mqtt_port" name="mqtt_port" value="{{ config.port or 1883 }}" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 font-medium mb-1" for="mqtt_topic">MQTT 主题:</label>
+                            <input type="text" id="mqtt_topic" name="mqtt_topic" value="{{ config.topic or '' }}" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="例如: rss/updates">
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 font-medium mb-1" for="mqtt_username">用户名 (可选):</label>
+                            <input type="text" id="mqtt_username" name="mqtt_username" value="{{ config.username or '' }}" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 font-medium mb-1" for="mqtt_password">密码 (可选):</label>
+                            <input type="password" id="mqtt_password" name="mqtt_password" value="{{ config.password or '' }}" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="mt-8 flex justify-between items-center">
+                    <a href="{{ url_for('index') }}" class="text-gray-600 hover:text-gray-800 text-sm">← 返回主页</a>
+                    <div>
+                        <a href="{{ url_for('test_mqtt') }}" class="inline-block bg-green-500 text-white px-6 py-2 rounded-md hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50">测试推送</a>
+                        <button type="submit" class="bg-blue-600 text-white px-6 py-2 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50">保存配置</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

@@ -6,3 +6,4 @@ beautifulsoup4
 gunicorn
 google-genai 
 aiohttp
+paho-mqtt

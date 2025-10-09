@@ -3,6 +3,7 @@ import os
 import sqlite3
 import logging
 import gc
+import json
 from datetime import datetime, timezone, timedelta
 import feedparser
 import aiohttp
@@ -12,6 +13,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.base import JobLookupError
 from bs4 import BeautifulSoup
+
+try:
+    import paho.mqtt.publish as mqtt_publish
+except ImportError:
+    print("错误: 无法导入 paho.mqtt.publish。请确保已安装：pip install paho-mqtt")
+    mqtt_publish = None
 
 try:
     from bark_sender import send_bark_notification
@@ -33,7 +40,8 @@ except ImportError:
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
     get_detailed_feed_items_for_summary,
-    get_all_keyword_triggers, add_keyword_trigger, delete_keyword_trigger
+    get_all_keyword_triggers, add_keyword_trigger, delete_keyword_trigger,
+    get_mqtt_config, save_mqtt_config
 )
 
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY', os.urandom(24))
@@ -126,12 +134,12 @@ def get_subscription_by_id(sub_id):
         logger.error(f"获取 ID 为 {sub_id} 的订阅时发生数据库错误: {e}")
         return None
 
-def update_subscription_last_item(sub_id, item_guid):
+def update_subscription_last_item_link(sub_id, item_link):
     try:
         with get_db_connection() as conn:
             conn.execute(
-                "UPDATE subscriptions SET last_fetched_item_guid = ?, last_checked_at = ? WHERE id = ?",
-                (item_guid, datetime.now(timezone.utc), sub_id)
+                "UPDATE subscriptions SET last_fetched_item_link = ?, last_checked_at = ? WHERE id = ?",
+                (item_link, datetime.now(timezone.utc), sub_id)
             )
             conn.commit()
     except sqlite3.Error as e:
@@ -263,9 +271,48 @@ def get_daily_feed_titles():
         logger.error(f"获取每日订阅标题时发生数据库错误: {e}")
         return []
 
-# --- RSS Processing and Bark Notification ---
+# --- MQTT, RSS Processing and Bark Notification ---
+
+def send_mqtt_notification(payload, is_test=False):
+    if not mqtt_publish:
+        logger.warning("MQTT 库 (paho-mqtt) 未加载，跳过 MQTT 推送。\n")
+        return False
+
+    mqtt_config = get_mqtt_config()
+    if not mqtt_config or not mqtt_config['enabled']:
+        if not is_test:
+            return True # Not enabled is not an error in normal flow
+        # If it is a test, we need to inform the user it's not enabled.
+        logger.warning("尝试测试 MQTT 但其未在配置中启用。\n")
+        return False
+
+    if not all([mqtt_config['host'], mqtt_config['port'], mqtt_config['topic']]):
+        logger.warning("MQTT 已启用但配置不完整 (主机、端口或主题缺失)，跳过推送。\n")
+        return False
+
+    auth = None
+    if mqtt_config['username']:
+        auth = {'username': mqtt_config['username'], 'password': mqtt_config['password']}
+
+    try:
+        logger.info(f"准备发送 MQTT 消息到主题 '{mqtt_config['topic']}'...\n")
+        mqtt_publish.single(
+            topic=mqtt_config['topic'],
+            payload=json.dumps(payload, ensure_ascii=False),
+            hostname=mqtt_config['host'],
+            port=mqtt_config['port'],
+            auth=auth,
+            qos=1,
+            retain=False
+        )
+        logger.info("MQTT 消息发送成功。\n")
+        return True
+    except Exception as e:
+        logger.error(f"发送 MQTT 消息失败: {e}", exc_info=True)
+        return False
+
 async def fetch_feed_content(url, sub_id):
-    headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.4 (sub_id:{sub_id})'}
+    headers = {'User-Agent': f'RSS-to-Bark-Pusher/1.5 (sub_id:{sub_id})'}
     timeout_config = aiohttp.ClientTimeout(total=FEED_REQUEST_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout_config) as session:
         try:
@@ -287,7 +334,7 @@ async def fetch_feed_content(url, sub_id):
 def process_feed(subscription_id, is_test_run=False):
     sub = get_subscription_by_id(subscription_id)
     if not sub:
-        logger.warning(f"订阅 {subscription_id} 在 process_feed 中未找到，跳过处理。")
+        logger.warning(f"订阅 {subscription_id} 在 process_feed 中未找到，跳过处理。\n")
         return
     
     logger.info(f"开始处理订阅: {sub['name']} ({sub['url']}) (Active: {sub['is_active']}, Test: {is_test_run})")
@@ -308,50 +355,52 @@ def process_feed(subscription_id, is_test_run=False):
         logger.warning(f"订阅 {sub['name']} ({sub['url']}) 格式可能不正确: {bozo_exc_type} - {bozo_exc_msg}")
     
     if not feed_data.entries:
-        logger.info(f"订阅 {sub['name']} ({sub['url']}) 没有条目。")
+        logger.info(f"订阅 {sub['name']} ({sub['url']}) 没有条目。\n")
         return
 
-    def get_entry_guid(entry):
-        return entry.get('id', entry.get('link', entry.get('title', f"no_guid_fallback_{datetime.now(timezone.utc).timestamp()}")))
+    def get_entry_link(entry):
+        return entry.get('link')
 
+    new_items_to_notify = []
     try:
         with get_db_connection() as conn:
-            for entry in feed_data.entries:
+            # 倒序遍历条目（从最旧到最新），以保持通知的正确时间顺序
+            for entry in reversed(feed_data.entries):
                 title = entry.get('title', '无标题')
-                guid = get_entry_guid(entry)
-                conn.execute(
-                    "INSERT OR IGNORE INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                    (sub['id'], title, guid, datetime.now(timezone.utc))
+                link = get_entry_link(entry)
+                
+                # 尝试插入。如果 link 是唯一的，插入会成功，说明是新条目。
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                    (sub['id'], title, link, datetime.now(timezone.utc)) 
                 )
+                
+                # 如果 rowcount 是 1，表示插入成功（即，这是一个新条目）
+                if cursor.rowcount == 1:
+                    new_items_to_notify.append(entry)
+            
             conn.commit()
     except sqlite3.Error as e:
-        logger.error(f"保存订阅 {sub['name']} 的条目到数据库时出错: {e}")
+        logger.error(f"在为订阅 {sub['name']} 保存和检查条目时发生数据库错误: {e}")
+        return # 如果数据库操作失败，则中止
 
-    last_known_guid = sub['last_fetched_item_guid']
-    temp_new_items = []
-    if not last_known_guid and not is_test_run:
-        if feed_data.entries:
-            temp_new_items.append(feed_data.entries[0])
-            logger.info(f"首次运行 {sub['name']}, 标记最新条目: {feed_data.entries[0].get('title', '无标题')}")
-    else:
-        for entry in feed_data.entries:
-            entry_guid = get_entry_guid(entry)
-            if entry_guid == last_known_guid:
-                break
-            temp_new_items.append(entry)
-    new_items_to_notify = list(reversed(temp_new_items))
+    # 如果是首次运行且检测到多个新条目，则只通知最新的一条以防刷屏
+    # 'last_fetched_item_link' 字段现在作为一个标志，判断是否为首次运行
+    if not sub['last_fetched_item_link'] and not is_test_run and len(new_items_to_notify) > 1:
+        logger.info(f"首次运行 {sub['name']} 检测到 {len(new_items_to_notify)} 个新条目。为避免刷屏，仅处理最新的一条。")
+        new_items_to_notify = [new_items_to_notify[-1]]
 
     if not sub['is_active'] and not is_test_run:
-        logger.info(f"订阅 {sub['name']} 未激活，开始检查关键词触发。")
+        logger.info(f"订阅 {sub['name']} 未激活，开始检查关键词触发。\n")
         keyword_triggers = get_all_keyword_triggers()
         
         if new_items_to_notify and keyword_triggers:
-            notified_guids_this_run = set()
+            notified_links_this_run = set()
             for item in new_items_to_notify:
                 item_title = item.get('title', '无标题')
-                item_guid = get_entry_guid(item)
+                item_link = get_entry_link(item)
                 
-                if item_guid in notified_guids_this_run:
+                if item_link in notified_links_this_run:
                     continue
 
                 for trigger in keyword_triggers:
@@ -366,7 +415,7 @@ def process_feed(subscription_id, is_test_run=False):
                         
                         notification_title = f"[关键词: {keyword}] {sub['name']}: {item_title}"
                         
-                        send_bark_notification(
+                        success, _ = send_bark_notification(
                             device_key=trigger['bark_key'],
                             title=notification_title,
                             body=body_content[:500],
@@ -374,14 +423,25 @@ def process_feed(subscription_id, is_test_run=False):
                             sound="glass",
                             group=f"关键词-{sub['name']}"
                         )
-                        notified_guids_this_run.add(item_guid)
-                        break 
+                        if success:
+                            mqtt_payload = {
+                                'source': 'keyword_trigger',
+                                'subscription_name': sub['name'],
+                                'keyword': keyword,
+                                'title': item_title,
+                                'body': body_content[:500],
+                                'link': link
+                            }
+                            send_mqtt_notification(mqtt_payload)
+
+                        notified_links_this_run.add(item_link)
+                        break
         
         if feed_data.entries:
-            latest_entry_guid = get_entry_guid(feed_data.entries[0])
-            if sub['last_fetched_item_guid'] != latest_entry_guid:
-                 update_subscription_last_item(sub['id'], latest_entry_guid)
-                 logger.info(f"非激活订阅 {sub['name']} 更新了 last_fetched_item_guid 为: {latest_entry_guid}")
+            latest_entry_link = get_entry_link(feed_data.entries[0])
+            if sub['last_fetched_item_link'] != latest_entry_link:
+                 update_subscription_last_item_link(sub['id'], latest_entry_link)
+                 logger.info(f"非激活订阅 {sub['name']} 更新了 last_fetched_item_link 为: {latest_entry_link}")
         return
 
     items_for_active_or_test = []
@@ -390,21 +450,21 @@ def process_feed(subscription_id, is_test_run=False):
             items_for_active_or_test.append(feed_data.entries[0])
             logger.info(f"[测试模式] 为 {sub['name']} 准备推送最新条目: {feed_data.entries[0].get('title', '无标题')}")
         else:
-            logger.info(f"[测试模式] 订阅 {sub['name']} 没有条目可供测试。")
+            logger.info(f"[测试模式] 订阅 {sub['name']} 没有条目可供测试。\n")
             return
     else:
         items_for_active_or_test = new_items_to_notify
 
     if not items_for_active_or_test:
-        logger.info(f"订阅 {sub['name']} 没有新内容。")
+        logger.info(f"订阅 {sub['name']} 没有新内容。\n")
         if feed_data.entries and not is_test_run:
-            latest_entry_guid = get_entry_guid(feed_data.entries[0])
-            if sub['last_fetched_item_guid'] != latest_entry_guid:
-                update_subscription_last_item(sub['id'], latest_entry_guid)
-                logger.info(f"订阅 {sub['name']} 没有新通知内容，但更新了 last_fetched_item_guid 为: {latest_entry_guid}")
+            latest_entry_link = get_entry_link(feed_data.entries[0])
+            if sub['last_fetched_item_link'] != latest_entry_link:
+                update_subscription_last_item_link(sub['id'], latest_entry_link)
+                logger.info(f"订阅 {sub['name']} 没有新通知内容，但更新了 last_fetched_item_link 为: {latest_entry_link}")
         return
 
-    latest_sent_guid_this_run = None
+    latest_sent_link_this_run = None
     effective_title_prefix = "[测试] " if is_test_run else ""
     success_flag = False
 
@@ -430,30 +490,32 @@ def process_feed(subscription_id, is_test_run=False):
         if success_flag:
             logger.info(f"Bark 通知发送成功 for '{title}'. Message ID: {response_data.get('messageid', 'N/A')}")
             if not is_test_run:
-                latest_sent_guid_this_run = get_entry_guid(item)
+                latest_sent_link_this_run = get_entry_link(item)
+            
+            mqtt_payload = {
+                'source': 'single_item',
+                'subscription_name': sub['name'],
+                'title': title,
+                'body': body_content[:500],
+                'link': link,
+                'is_test': is_test_run
+            }
+            send_mqtt_notification(mqtt_payload)
         else:
             logger.error(f"Bark 通知发送失败 for '{title}'. 错误: {response_data.get('message', '未知错误')}")
 
     elif len(items_for_active_or_test) > 1:
         num_new_items = len(items_for_active_or_test)
         aggregated_title = f"{effective_title_prefix}{sub['name']} 有 {num_new_items} 条新更新"
-        aggregated_body_titles_part = []
-        aggregated_body_links_part = []
-
-        for i, item in enumerate(items_for_active_or_test):
-            item_title = item.get('title', '无标题')
-            item_link = item.get('link', '')
-            aggregated_body_titles_part.append(f"{i+1}. {item_title}")
-            if item_link:
-                aggregated_body_links_part.append(f"链接{i+1}: {item_link}")
-            else:
-                aggregated_body_links_part.append(f"链接{i+1}: (无链接)")
-
-        aggregated_body = "\n".join(aggregated_body_titles_part)
-        if aggregated_body_links_part:
-            aggregated_body += "\n---\n"
-            aggregated_body += "\n".join(aggregated_body_links_part)
         
+        items_payload = []
+        for item in items_for_active_or_test:
+            items_payload.append({
+                'title': item.get('title', '无标题'),
+                'link': item.get('link', '')
+            })
+
+        aggregated_body = "\n".join([f"{i+1}. {item['title']}" for i, item in enumerate(items_payload)])
         primary_url_for_notification = items_for_active_or_test[-1].get('link', sub['url'])
 
         logger.info(f"准备发送 Bark 通知 (聚合 {num_new_items} 条目): Feed='{sub['name']}' (Test: {is_test_run})")
@@ -470,15 +532,34 @@ def process_feed(subscription_id, is_test_run=False):
             logger.info(f"聚合 Bark 通知发送成功 for {num_new_items} items from '{sub['name']}'. Message ID: {response_data.get('messageid', 'N/A')}")
             if not is_test_run:
                 latest_item_in_batch = items_for_active_or_test[-1]
-                latest_sent_guid_this_run = get_entry_guid(latest_item_in_batch)
+                latest_sent_link_this_run = get_entry_link(latest_item_in_batch)
+
+            # For aggregated notifications, send MQTT for each item individually
+            logger.info(f"聚合 Bark 通知成功后，为 {num_new_items} 个条目单独发送 MQTT 通知。")
+            for item in items_for_active_or_test:
+                title = item.get('title', '无标题')
+                link = item.get('link', '')
+                raw_summary = item.get('summary', item.get('description', title))
+                soup = BeautifulSoup(raw_summary, "html.parser")
+                body_content = soup.get_text(separator=' ', strip=True)
+
+                mqtt_payload = {
+                    'source': 'single_item_from_aggregated',
+                    'subscription_name': sub['name'],
+                    'title': title,
+                    'body': body_content[:500],
+                    'link': link,
+                    'is_test': is_test_run
+                }
+                send_mqtt_notification(mqtt_payload)
         else:
             logger.error(f"聚合 Bark 通知发送失败 for '{sub['name']}'. 错误: {response_data.get('message', '未知错误')}")
 
-    if latest_sent_guid_this_run and not is_test_run:
-        update_subscription_last_item(sub['id'], latest_sent_guid_this_run)
-        logger.info(f"更新订阅 {sub['name']} 的 last_fetched_item_guid 为: {latest_sent_guid_this_run}")
+    if latest_sent_link_this_run and not is_test_run:
+        update_subscription_last_item_link(sub['id'], latest_sent_link_this_run)
+        logger.info(f"更新订阅 {sub['name']} 的 last_fetched_item_link 为: {latest_sent_link_this_run}")
     elif is_test_run and items_for_active_or_test:
-        logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_guid 未更新。")
+        logger.info(f"[测试模式] 订阅 {sub['name']} 的测试通知已尝试发送。last_fetched_item_link 未更新。\n")
 
     del feed_data
     gc.collect()
@@ -487,19 +568,19 @@ def process_feed(subscription_id, is_test_run=False):
 def generate_daily_summary():
     config_row = get_summary_config()
     if not config_row or not config_row['gemini_api_key']:
-        logger.warning("未配置 Gemini API Key，跳过每日总结。")
+        logger.warning("未配置 Gemini API Key，跳过每日总结。\n")
         return
     if not config_row['summary_bark_key']:
-        logger.warning("未配置总结 Bark Key，跳过每日总结通知。")
+        logger.warning("未配置总结 Bark Key，跳过每日总结通知。\n")
         return
     if not genai or not types:
-        logger.error("Gemini 库未加载，无法生成总结。")
+        logger.error("Gemini 库未加载，无法生成总结。\n")
         return
 
     titles = get_daily_feed_titles()
     interval_hours = config_row['interval_hours'] if config_row['interval_hours'] is not None else 24
     if not titles:
-        logger.info(f"过去{interval_hours}小时内没有新订阅标题，跳过总结。")
+        logger.info(f"过去{interval_hours}小时内没有新订阅标题，跳过总结。\n")
         return
 
     sub_titles = {}
@@ -528,7 +609,7 @@ def generate_daily_summary():
             config=config,
         )
         summary_text = response.text
-        logger.info("Gemini API 成功生成总结。")
+        logger.info("Gemini API 成功生成总结。\n")
 
         save_summary_result(summary_text)
 
@@ -541,6 +622,12 @@ def generate_daily_summary():
         )
         if success:
             logger.info(f"每日总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
+            mqtt_payload = {
+                'source': 'daily_summary',
+                'title': "每日RSS总结",
+                'body': summary_text[:2000]
+            }
+            send_mqtt_notification(mqtt_payload)
         else:
             logger.error(f"每日总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
     except Exception as e:
@@ -557,7 +644,7 @@ def schedule_feed_job(subscription):
             scheduler.remove_job(job_id)
             logger.info(f"已移除现有任务: {job_id} (在重新调度前)")
     except JobLookupError:
-        logger.debug(f"任务 {job_id} 未找到，无需移除。")
+        logger.debug(f"任务 {job_id} 未找到，无需移除。\n")
     except Exception as e:
         logger.error(f"移除任务 {job_id} 时发生错误: {e}", exc_info=True)
 
@@ -579,10 +666,10 @@ def schedule_feed_job(subscription):
 def schedule_summary_job():
     config_row = get_summary_config()
     if not config_row or not config_row['interval_hours']:
-        logger.info("未配置总结间隔或总结间隔为0，跳过总结任务调度。")
+        logger.info("未配置总结间隔或总结间隔为0，跳过总结任务调度。\n")
         return
     if config_row['interval_hours'] < 1:
-        logger.warning(f"总结间隔配置为 {config_row['interval_hours']} 小时，至少应为1小时。跳过总结任务调度。")
+        logger.warning(f"总结间隔配置为 {config_row['interval_hours']} 小时，至少应为1小时。跳过总结任务调度。\n")
         return
 
     job_id = "daily_summary"
@@ -590,9 +677,9 @@ def schedule_summary_job():
         existing_job = scheduler.get_job(job_id)
         if existing_job:
             scheduler.remove_job(job_id)
-            logger.info(f"已移除现有总结任务: {job_id}")
+            logger.info(f"已移除现有总结任务: {job_id}\n")
     except JobLookupError:
-        logger.debug("总结任务未找到，无需移除。")
+        logger.debug("总结任务未找到，无需移除。\n")
     try:
         scheduler.add_job(
             func=generate_daily_summary,
@@ -612,9 +699,9 @@ def schedule_cleanup_job():
         existing_job = scheduler.get_job(job_id)
         if existing_job:
             scheduler.remove_job(job_id)
-            logger.info(f"已移除现有清理任务: {job_id}")
+            logger.info(f"已移除现有清理任务: {job_id}\n")
     except JobLookupError:
-        logger.debug("清理任务未找到，无需移除。")
+        logger.debug("清理任务未找到，无需移除。\n")
     try:
         scheduler.add_job(
             func=cleanup_old_feed_items,
@@ -629,7 +716,7 @@ def schedule_cleanup_job():
         logger.error(f"调度每日清理任务失败: {e}", exc_info=True)
 
 def reschedule_all_jobs():
-    logger.info("重新加载并调度所有订阅任务和总结任务...")
+    logger.info("重新加载并调度所有订阅任务和总结任务...\n")
     try:
         subscriptions = get_all_subscriptions()
     except Exception as e:
@@ -640,7 +727,7 @@ def reschedule_all_jobs():
         if job.id.startswith("feed_") or job.id == "daily_summary" or job.id == "cleanup_feed_items":
             try:
                 scheduler.remove_job(job.id)
-                logger.info(f"已移除旧任务: {job.id} (在重新调度所有任务前)")
+                logger.info(f"已移除旧任务: {job.id} (在重新调度所有任务前)\n")
             except JobLookupError:
                 pass
             except Exception as e:
@@ -651,7 +738,7 @@ def reschedule_all_jobs():
 
     schedule_summary_job()
     schedule_cleanup_job()
-    logger.info("所有任务重新调度完成。")
+    logger.info("所有任务重新调度完成。\n")
 
 # --- Flask Routes ---
 @app.route('/', methods=['GET'])
@@ -777,9 +864,9 @@ def delete_subscription(sub_id):
         job_id = f"feed_{sub['id']}"
         try:
             scheduler.remove_job(job_id)
-            logger.info(f"已移除任务: {job_id} (因删除订阅)")
+            logger.info(f"已移除任务: {job_id} (因删除订阅)\n")
         except JobLookupError:
-            logger.info(f"任务 {job_id} 未找到，可能已被移除或未调度 (删除订阅时)。")
+            logger.info(f"任务 {job_id} 未找到，可能已被移除或未调度 (删除订阅时)。\n" )
         except Exception as e:
             logger.error(f"移除任务 {job_id} 时发生错误: {e}", exc_info=True)
 
@@ -822,6 +909,59 @@ def toggle_subscription_status(sub_id):
     else:
         flash(f"无法更改订阅 '{sub_before_toggle['name']}' 的状态。请检查日志。", 'error')
     return redirect(url_for('index'))
+
+@app.route('/mqtt_config', methods=['GET', 'POST'])
+def mqtt_config():
+    if request.method == 'POST':
+        enabled = 'mqtt_enabled' in request.form
+        host = request.form.get('mqtt_host', '').strip()
+        port_str = request.form.get('mqtt_port', '1883').strip()
+        topic = request.form.get('mqtt_topic', '').strip()
+        username = request.form.get('mqtt_username', '').strip()
+        password = request.form.get('mqtt_password', '').strip()
+
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            flash('端口必须是有效的数字。', 'error')
+            # Re-render with current (invalid) data
+            config_data = {
+                'enabled': enabled, 'host': host, 'port': port_str,
+                'topic': topic, 'username': username, 'password': password
+            }
+            return render_template('mqtt_config.html', config=config_data)
+
+        if enabled and not all([host, port, topic]):
+            flash('启用 MQTT 时，主机、端口和主题字段都是必填的。', 'error')
+            config_data = {
+                'enabled': enabled, 'host': host, 'port': port,
+                'topic': topic, 'username': username, 'password': password
+            }
+            return render_template('mqtt_config.html', config=config_data)
+
+        if save_mqtt_config(enabled, host, port, topic, username, password):
+            flash('MQTT 配置已成功保存。', 'success')
+        else:
+            flash('保存 MQTT 配置时发生错误，请检查日志。', 'error')
+        
+        return redirect(url_for('index'))
+
+    config = get_mqtt_config()
+    return render_template('mqtt_config.html', config=config or {})
+
+@app.route('/test_mqtt')
+def test_mqtt():
+    test_payload = {
+        'source': 'test_button',
+        'title': 'MQTT 连接测试',
+        'body': f'这是一条来自 RSS Bark Pusher 的测试消息。发送时间: {datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")}',
+        'is_test': True
+    }
+    if send_mqtt_notification(test_payload, is_test=True):
+        flash('MQTT 测试消息已成功发送，请检查您的 MQTT 客户端是否收到消息。', 'success')
+    else:
+        flash('MQTT 测试消息发送失败。请检查配置是否正确、MQTT服务是否启用，并查看应用日志获取详细信息。', 'error')
+    return redirect(url_for('mqtt_config'))
 
 @app.route('/keywords', methods=['GET', 'POST'])
 def keywords():
@@ -974,7 +1114,7 @@ def test_summary():
     formatted_titles_string = "\n".join(formatted_titles_list)
     
     final_prompt = prompt_template.replace("{sub_titles}", formatted_titles_string)
-    logger.info(f"测试总结使用的最终提示词: {final_prompt[:500]}...")
+    logger.info(f"测试总结使用的最终提示词: {final_prompt[:500]}...\n")
 
     try:
         client = genai.Client(api_key=config_row['gemini_api_key'])
@@ -986,7 +1126,7 @@ def test_summary():
             config=config,
         )
         summary_text = response.text
-        logger.info("Gemini API 成功生成测试总结。")
+        logger.info("Gemini API 成功生成测试总结。\n")
         
         save_summary_result(summary_text)
 
@@ -1000,6 +1140,15 @@ def test_summary():
         if success:
             logger.info(f"测试总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
             flash('测试总结已生成并发送，请检查Bark设备。总结结果已更新到页面。', 'success')
+            
+            mqtt_payload = {
+                'source': 'test_summary',
+                'title': "[测试] 每日RSS总结",
+                'body': summary_text[:2000],
+                'is_test': True
+            }
+            send_mqtt_notification(mqtt_payload)
+
             return redirect(url_for('summary_config', show_summary='true')) 
         else:
             logger.error(f"测试总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
@@ -1016,18 +1165,18 @@ db_dir_path = os.path.dirname(DATABASE_FILE)
 if not os.path.exists(db_dir_path):
     try:
         os.makedirs(db_dir_path)
-        logger.info(f"数据目录 {db_dir_path} 已创建 (在 app.py 启动时)。")
+        logger.info(f"数据目录 {db_dir_path} 已创建 (在 app.py 启动时)。\n")
     except OSError as e:
         logger.critical(f"无法创建数据目录 {db_dir_path}: {e}。应用可能无法正常工作。", exc_info=True)
 
 if not os.path.exists(DATABASE_FILE):
-    logger.info(f"数据库文件 {DATABASE_FILE} 未找到，正在调用 init_db()...")
+    logger.info(f"数据库文件 {DATABASE_FILE} 未找到，正在调用 init_db()...\n")
     try:
         init_db()
     except Exception as e:
         logger.critical(f"首次初始化数据库失败: {e}. 应用可能无法启动。", exc_info=True)
 else:
-    logger.info(f"使用现有数据库 {DATABASE_FILE}。调用 init_db() 以确保表结构和WAL模式...")
+    logger.info(f"使用现有数据库 {DATABASE_FILE}。调用 init_db() 以确保表结构和WAL模式...\n")
     try:
         init_db()
     except Exception as e:
@@ -1036,15 +1185,15 @@ else:
 if not scheduler.running:
     try:
         scheduler.start(paused=False)
-        logger.info("调度器已启动。")
+        logger.info("调度器已启动。\n")
         reschedule_all_jobs()
     except Exception as e:
         logger.critical(f"调度器启动失败: {e}", exc_info=True)
 else:
-    logger.warning("调度器已在运行，可能由Gunicorn --reload或多次导入触发。跳过重复启动。")
+    logger.warning("调度器已在运行，可能由Gunicorn --reload或多次导入触发。跳过重复启动。\n")
 
 if __name__ == '__main__':
-    logger.info("以开发模式启动 Flask 应用 (python app.py)...")
+    logger.info("以开发模式启动 Flask 应用 (python app.py)...\n")
     
     flask_debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     use_reloader_val = os.environ.get('FLASK_USE_RELOADER', 'False').lower() == 'true'
@@ -1071,11 +1220,11 @@ if __name__ == '__main__':
 
     app.run(host='0.0.0.0', port=5000, debug=flask_debug_mode, use_reloader=use_reloader_val)
 
-    logger.info("开发服务器正在关闭...")
+    logger.info("开发服务器正在关闭...\n")
     if scheduler.running:
         try:
-            logger.info("正在关闭调度器...")
+            logger.info("正在关闭调度器...\n")
             scheduler.shutdown()
-            logger.info("调度器已关闭。")
+            logger.info("调度器已关闭。\n")
         except Exception as e:
             logger.error(f"关闭调度器时出错: {e}", exc_info=True)

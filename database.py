@@ -10,10 +10,10 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 # --- 配置数据库文件路径 ---
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_SUBDIR = "data"
+# 将数据目录硬编码为 /app/data，以匹配 docker-compose.yml 中的挂载点。
+DATA_DIR = "/app/data"
 DATABASE_FILENAME = "subscriptions.db"
-DATABASE_FILE = os.path.join(APP_DIR, DATA_SUBDIR, DATABASE_FILENAME)
+DATABASE_FILE = os.path.join(DATA_DIR, DATABASE_FILENAME)
 
 # 添加一个线程锁来序列化关键数据库操作
 _db_lock = threading.RLock()
@@ -115,6 +115,33 @@ def get_db_connection(timeout_seconds=30):
             except Exception as e:
                 logger.error(f"关闭数据库连接时出错: {e}")
 
+# --- MQTT 配置相关函数 ---
+def get_mqtt_config():
+    """获取 MQTT 配置"""
+    try:
+        with get_db_connection() as conn:
+            config = conn.execute("SELECT * FROM mqtt_config WHERE id = 1").fetchone()
+            return config
+    except sqlite3.Error as e:
+        logger.error(f"获取 MQTT 配置时发生数据库错误: {e}")
+        return None
+
+def save_mqtt_config(enabled, host, port, topic, username, password):
+    """保存 MQTT 配置"""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                """UPDATE mqtt_config SET 
+                   enabled = ?, host = ?, port = ?, topic = ?, username = ?, password = ?
+                   WHERE id = 1""",
+                (enabled, host, port, topic, username, password)
+            )
+            conn.commit()
+            return True
+    except sqlite3.Error as e:
+        logger.error(f"保存 MQTT 配置时发生数据库错误: {e}")
+        return False
+
 # --- 关键词触发器相关函数 ---
 def get_all_keyword_triggers():
     """获取所有关键词触发器"""
@@ -155,7 +182,7 @@ def delete_keyword_trigger(keyword_id):
         return False
 
 # --- 其他数据库函数 ---
-def cleanup_old_feed_items(days=1):
+def cleanup_old_feed_items(days=30):
     try:
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
@@ -224,7 +251,7 @@ def init_db():
                     url TEXT NOT NULL UNIQUE,
                     interval_minutes INTEGER NOT NULL DEFAULT 60,
                     bark_key TEXT NOT NULL,
-                    last_fetched_item_guid TEXT,
+                    last_fetched_item_link TEXT,
                     is_active BOOLEAN NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
                     last_checked_at TIMESTAMP
@@ -237,14 +264,14 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     subscription_id INTEGER NOT NULL,
                     title TEXT NOT NULL,
-                    guid TEXT NOT NULL UNIQUE,
+                    link TEXT NOT NULL UNIQUE,
                     fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
                 )
             ''')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_subscription_id ON feed_items(subscription_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_fetched_at ON feed_items(fetched_at);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_guid ON feed_items(guid);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_items_link ON feed_items(link);")
 
             # 创建 summary_config 表
             conn.execute('''
@@ -270,6 +297,19 @@ def init_db():
             ''')
             conn.execute("CREATE INDEX IF NOT EXISTS idx_keyword_triggers_keyword ON keyword_triggers(keyword);")
 
+            # [新增] 创建 mqtt_config 表
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS mqtt_config (
+                    id INTEGER PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL DEFAULT 0,
+                    host TEXT,
+                    port INTEGER,
+                    topic TEXT,
+                    username TEXT,
+                    password TEXT
+                )
+            ''')
+
             logger.info("正在检查并迁移 summary_config 表结构...")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_prompt", "TEXT")
@@ -283,6 +323,12 @@ def init_db():
             ''')
             conn.execute('''
                 UPDATE summary_config SET interval_hours = COALESCE(interval_hours, 24) WHERE id = 1
+            ''')
+
+            # [新增] 初始化 MQTT 配置
+            conn.execute('''
+                INSERT OR IGNORE INTO mqtt_config (id, enabled, port) 
+                VALUES (1, 0, 1883)
             ''')
 
             conn.commit()
@@ -309,7 +355,7 @@ def get_detailed_feed_items_for_summary(interval_hours):
         with get_db_connection() as conn:
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=interval_hours)
             items = conn.execute(
-                """SELECT s.name AS subscription_name, f.title AS item_title, f.guid, f.fetched_at
+                """SELECT s.name AS subscription_name, f.title AS item_title, f.link, f.fetched_at
                    FROM feed_items f
                    JOIN subscriptions s ON f.subscription_id = s.id
                    WHERE f.fetched_at >= ?
@@ -358,6 +404,20 @@ if __name__ == '__main__':
             assert summary_row['interval_hours'] == 24, f"summary_config id=1 的 interval_hours ({summary_row['interval_hours']}) 不正确"
             logger.info("summary_config 默认行和 interval_hours 验证通过。")
 
+            logger.info("验证 mqtt_config 表结构和默认值:")
+            cursor = conn_test.execute("PRAGMA table_info(mqtt_config)")
+            columns = [row['name'] for row in cursor.fetchall()]
+            expected_columns = ['id', 'enabled', 'host', 'port', 'topic', 'username', 'password']
+            for col in expected_columns:
+                assert col in columns, f"列 {col} 未在 mqtt_config 表中找到!"
+            logger.info(f"mqtt_config 表列: {columns} - 验证通过")
+            mqtt_row = conn_test.execute("SELECT * FROM mqtt_config WHERE id = 1").fetchone()
+            assert mqtt_row is not None, "mqtt_config id=1 的默认行未找到"
+            assert mqtt_row['enabled'] == 0, "mqtt_config enabled 默认值不为 0"
+            assert mqtt_row['port'] == 1883, "mqtt_config port 默认值不为 1883"
+            logger.info("mqtt_config 默认行和值验证通过。")
+
+
             logger.info("测试时间戳转换...")
             conn_test.execute("DROP TABLE IF EXISTS test_datetime")
             conn_test.execute("CREATE TABLE test_datetime (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
@@ -380,10 +440,10 @@ if __name__ == '__main__':
             conn_test.commit()
             three_days_ago_cleanup = datetime.now(timezone.utc) - timedelta(days=3)
             half_day_ago_cleanup = datetime.now(timezone.utc) - timedelta(hours=12) # Changed to half day for cleanup test
-            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id_cleanup, "Old Item", "guid_old_cleanup", three_days_ago_cleanup))
-            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id_cleanup, "New Item", "guid_new_cleanup", half_day_ago_cleanup))
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_cleanup, "Old Item", "link_old_cleanup", three_days_ago_cleanup))
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_cleanup, "New Item", "link_new_cleanup", half_day_ago_cleanup))
             conn_test.commit()
             deleted_count = cleanup_old_feed_items(days=1) # cleanup items older than 1 day
             assert deleted_count == 1, f"清理计数错误，应为1，实际为{deleted_count}"
@@ -397,19 +457,19 @@ if __name__ == '__main__':
             # Add items for get_detailed_feed_items_for_summary test
             # Item within 24 hours
             item_1_time = datetime.now(timezone.utc) - timedelta(hours=5)
-            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id_detail, "Recent Item 1", "guid_detail_1", item_1_time))
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail, "Recent Item 1", "link_detail_1", item_1_time))
             # Item outside 24 hours (e.g., 30 hours ago)
             item_2_time = datetime.now(timezone.utc) - timedelta(hours=30)
-            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id_detail, "Old Item Detail", "guid_detail_2", item_2_time))
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail, "Old Item Detail", "link_detail_2", item_2_time))
             # Item from another subscription, also recent
             sub_id_detail_other = conn_test.execute("INSERT INTO subscriptions (name, url, bark_key) VALUES (?, ?, ?)",
                                        ("Other Detail Sub", "http://example.com/rss_other_detail", "testkey_other_detail")).lastrowid
             conn_test.commit()
             item_3_time = datetime.now(timezone.utc) - timedelta(hours=2)
-            conn_test.execute("INSERT INTO feed_items (subscription_id, title, guid, fetched_at) VALUES (?, ?, ?, ?)",
-                              (sub_id_detail_other, "Recent Item Other Sub", "guid_detail_3", item_3_time))
+            conn_test.execute("INSERT INTO feed_items (subscription_id, title, link, fetched_at) VALUES (?, ?, ?, ?)",
+                              (sub_id_detail_other, "Recent Item Other Sub", "link_detail_3", item_3_time))
             conn_test.commit()
             
             detailed_items = get_detailed_feed_items_for_summary(interval_hours=24)

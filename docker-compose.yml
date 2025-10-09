@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  rss-bark-pusher:
+    build: .                       # 在当前目录编译 Dockerfile
+    image: rss-bark-pusher:latest  # 编译后生成的镜像名
+    container_name: my-rss-pusher
+    restart: always
+    ports:
+      - "5000:5000"
+    volumes:
+      - /root/rss_mine:/app/data
