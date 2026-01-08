@@ -24,18 +24,20 @@ try:
     from bark_sender import send_bark_notification
 except ImportError:
     print("错误: 无法导入 bark_sender.py。请确保该文件存在于同一目录下。")
-    def send_bark_notification(device_key, body, title="", **kwargs):
-        print(f"[DUMMY BARK] To: {device_key}, Title: {title}, Body: {body}")
+    def send_bark_notification(device_key, body, title="", markdown="", **kwargs):
+        print(f"[DUMMY BARK] To: {device_key}, Title: {title}, Body: {body}, Markdown: {markdown}")
         print(f"Other args: {kwargs}")
         return True, {"messageid": "dummy_id", "code": 200, "message": "Dummy success"}
 
 try:
     from google import genai
     from google.genai import types
+    from google.genai.errors import ClientError
 except ImportError:
     print("错误: 无法导入 google.genai。请确保已安装：pip install -q -U google-genai ")
     genai = None
     types = None
+    ClientError = None
 
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
@@ -216,7 +218,7 @@ def get_summary_config():
         logger.error(f"获取总结配置时发生数据库错误: {e}")
         return None
 
-def update_summary_config(api_key, prompt, interval_hours, summary_bark_key):
+def update_summary_config(api_key, gemini_model, prompt, interval_hours, summary_bark_key):
     try:
         with get_db_connection() as conn:
             conn.execute(
@@ -226,14 +228,15 @@ def update_summary_config(api_key, prompt, interval_hours, summary_bark_key):
             conn.execute(
                 """UPDATE summary_config
                    SET gemini_api_key = ?,
+                       gemini_model = ?,
                        summary_prompt = ?,
                        interval_hours = ?,
                        summary_bark_key = ?
                    WHERE id = 1""",
-                (api_key, prompt, interval_hours, summary_bark_key)
+                (api_key, gemini_model, prompt, interval_hours, summary_bark_key)
             )
             conn.commit()
-            logger.info(f"总结配置已更新: API Key (已设置: {'是' if api_key else '否'}), Interval: {interval_hours}h, Bark Key (已设置: {'是' if summary_bark_key else '否'})")
+            logger.info(f"总结配置已更新: API Key (已设置: {'是' if api_key else '否'}), Model: {gemini_model}, Interval: {interval_hours}h, Bark Key (已设置: {'是' if summary_bark_key else '否'})")
             return True
     except sqlite3.Error as e:
         logger.error(f"更新总结配置时发生数据库错误: {e}")
@@ -515,14 +518,15 @@ def process_feed(subscription_id, is_test_run=False):
                 'link': item.get('link', '')
             })
 
-        aggregated_body = "\n".join([f"{i+1}. {item['title']}" for i, item in enumerate(items_payload)])
+        aggregated_markdown = "\n".join([f"{i+1}. [{item['title']}]({item['link']})" for i, item in enumerate(items_payload)])
         primary_url_for_notification = items_for_active_or_test[-1].get('link', sub['url'])
 
         logger.info(f"准备发送 Bark 通知 (聚合 {num_new_items} 条目): Feed='{sub['name']}' (Test: {is_test_run})")
         success_flag, response_data = send_bark_notification(
             device_key=sub['bark_key'],
             title=aggregated_title,
-            body=aggregated_body[:2000],
+            body="",
+            markdown=aggregated_markdown[:2000],
             url=primary_url_for_notification,
             sound="glass",
             group=sub['name']
@@ -603,20 +607,26 @@ def generate_daily_summary():
         client = genai.Client(api_key=config_row['gemini_api_key'])
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config = types.GenerateContentConfig(tools=[grounding_tool])
+        
+        model_name = config_row['gemini_model']
+        if not model_name:
+            model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+            
         response = client.models.generate_content(
-            model=os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash'),
+            model=model_name,
             contents=final_prompt,
             config=config,
         )
         summary_text = response.text
-        logger.info("Gemini API 成功生成总结。\n")
+        logger.info(f"Gemini API 成功生成总结 (Model: {model_name})。\n")
 
         save_summary_result(summary_text)
 
         success, response_data = send_bark_notification(
             device_key=config_row['summary_bark_key'],
             title="每日RSS总结",
-            body=summary_text[:2000],
+            body="",
+            markdown=summary_text[:2000],
             sound="glass",
             group="每日总结"
         )
@@ -630,6 +640,11 @@ def generate_daily_summary():
             send_mqtt_notification(mqtt_payload)
         else:
             logger.error(f"每日总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
+    except ClientError as e:
+        if e.code == 429:
+             logger.warning(f"Gemini API 限额已达 (429). 请检查配额或稍后再试。错误信息: {e.message}")
+        else:
+             logger.error(f"调用 Gemini API 失败 (ClientError): {e}", exc_info=True)
     except Exception as e:
         logger.error(f"调用 Gemini API 生成总结失败: {e}", exc_info=True)
     finally:
@@ -997,7 +1012,7 @@ def summary_config():
         current_config_dict = dict(db_config_row)
     else:
         current_config_dict = {
-            'id': 1, 'gemini_api_key': None, 'summary_prompt': None, 
+            'id': 1, 'gemini_api_key': None, 'gemini_model': None, 'summary_prompt': None, 
             'interval_hours': 24, 'summary_bark_key': None, 
             'last_summary': None, 'last_summary_at': None
         }
@@ -1023,6 +1038,7 @@ def summary_config():
             actual_summary_bark_key = form_summary_bark_key_input
         
         summary_prompt_from_form = request.form.get('summary_prompt', '').strip()
+        gemini_model_from_form = request.form.get('gemini_model', '').strip()
         interval_hours_str_from_form = request.form.get('interval_hours', '24').strip()
 
         try:
@@ -1032,6 +1048,7 @@ def summary_config():
                 form_data_for_render = current_config_dict.copy()
                 form_data_for_render.update({
                     'gemini_api_key': actual_gemini_api_key, 
+                    'gemini_model': gemini_model_from_form,
                     'summary_prompt': summary_prompt_from_form,
                     'interval_hours': interval_hours_str_from_form,
                     'summary_bark_key': actual_summary_bark_key
@@ -1042,13 +1059,14 @@ def summary_config():
             form_data_for_render = current_config_dict.copy()
             form_data_for_render.update({
                 'gemini_api_key': actual_gemini_api_key,
+                'gemini_model': gemini_model_from_form,
                 'summary_prompt': summary_prompt_from_form,
                 'interval_hours': interval_hours_str_from_form,
                 'summary_bark_key': actual_summary_bark_key
             })
             return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False)
 
-        if update_summary_config(actual_gemini_api_key, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
+        if update_summary_config(actual_gemini_api_key, gemini_model_from_form, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
             schedule_summary_job()
             flash('总结配置已更新并重新调度。', 'success')
         else:
@@ -1058,6 +1076,20 @@ def summary_config():
     feed_items_to_display = None 
     show_items_area_flag = False
     show_summary_area_flag = False
+    available_models = []
+    
+    # Fetch available models if API key is present
+    api_key_for_models = current_config_dict.get('gemini_api_key')
+    if api_key_for_models and genai:
+        try:
+            client = genai.Client(api_key=api_key_for_models)
+            for model in client.models.list():
+                if 'generateContent' in model.supported_actions:
+                    available_models.append(model.name.replace('models/', ''))
+            available_models.sort()
+        except Exception as e:
+            logger.error(f"获取模型列表失败: {e}")
+            # Don't flash error here to avoid annoyance on every page load if key is invalid/expired temporarily
 
     if request.args.get('show_items', 'false').lower() == 'true':
         show_items_area_flag = True
@@ -1078,7 +1110,8 @@ def summary_config():
                            config=current_config_dict, 
                            feed_items_for_summary=feed_items_to_display, 
                            show_items_area=show_items_area_flag,
-                           show_summary_area=show_summary_area_flag)
+                           show_summary_area=show_summary_area_flag,
+                           available_models=available_models)
 
 @app.route('/test_summary')
 def test_summary():
@@ -1120,20 +1153,26 @@ def test_summary():
         client = genai.Client(api_key=config_row['gemini_api_key'])
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config = types.GenerateContentConfig(tools=[grounding_tool])
+        
+        model_name = config_row['gemini_model']
+        if not model_name:
+             model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+
         response = client.models.generate_content(
-            model=os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash'),
+            model=model_name,
             contents=final_prompt,
             config=config,
         )
         summary_text = response.text
-        logger.info("Gemini API 成功生成测试总结。\n")
+        logger.info(f"Gemini API 成功生成测试总结 (Model: {model_name})。\n")
         
         save_summary_result(summary_text)
 
         success, response_data = send_bark_notification(
             device_key=config_row['summary_bark_key'],
             title="[测试] 每日RSS总结",
-            body=summary_text[:2000],
+            body="",
+            markdown=summary_text[:2000],
             sound="glass",
             group="每日总结"
         )
@@ -1154,6 +1193,14 @@ def test_summary():
             logger.error(f"测试总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
             flash('测试总结通知发送失败，请检查日志。总结结果仍会更新到页面。', 'warning')
             return redirect(url_for('summary_config', show_summary='true'))
+    except ClientError as e:
+        if e.code == 429:
+            logger.warning(f"测试总结失败: Gemini API 限额已达 (429)。{e.message}")
+            flash(f"Gemini API 限额已达，请稍后再试。详细信息已记录到日志。", 'warning')
+            return redirect(url_for('summary_config', show_summary='true'))
+        else:
+            logger.error(f"测试总结失败 (ClientError): {e}", exc_info=True)
+            flash(f"测试总结失败 (API Error): {e}", 'error')
     except Exception as e:
         logger.error(f"测试总结失败: {e}", exc_info=True)
         flash(f"测试总结失败: {e}", 'error')

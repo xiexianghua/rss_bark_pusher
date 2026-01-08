@@ -278,6 +278,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS summary_config (
                     id INTEGER PRIMARY KEY,
                     gemini_api_key TEXT,
+                    gemini_model TEXT,
                     summary_prompt TEXT,
                     interval_hours INTEGER DEFAULT 24,
                     summary_bark_key TEXT, 
@@ -312,6 +313,7 @@ def init_db():
 
             logger.info("正在检查并迁移 summary_config 表结构...")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
+            _add_column_if_not_exists(conn, "summary_config", "gemini_model", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_prompt", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_bark_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary", "TEXT")

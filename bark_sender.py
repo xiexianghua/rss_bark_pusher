@@ -5,13 +5,13 @@ import os
 
 logger = logging.getLogger(__name__) # 获取 logger 实例
 
-def send_bark_notification(device_key, body, title="", sound="", icon="", group="", url="", copy_text="", is_archive="0", level=""):
+def send_bark_notification(device_key, body, title="", sound="", icon="", group="", url="", copy_text="", is_archive="0", level="", markdown=""):
     """
     发送 Bark 推送通知。
 
     参数:
     device_key (str): 你的 Bark 设备 Key。
-    body (str): 推送通知的主要内容。 (必填)
+    body (str): 推送通知的主要内容。如果提供了 markdown 参数，此字段将被忽略。
     title (str, optional): 推送通知的标题。
     sound (str, optional): 推送铃声。例如 "bell", "birdsong", "glass"。更多请参考 Bark App。
     icon (str, optional): 自定义推送图标的 URL (必须是 https)。
@@ -20,6 +20,7 @@ def send_bark_notification(device_key, body, title="", sound="", icon="", group=
     copy_text (str, optional): 点击推送时自动复制的文本。
     is_archive (str, optional): 设置为 "1" 时，推送会直接存为历史记录，而不会弹出提示。
     level (str, optional): 推送级别 (iOS 15+)，可选 "active", "timeSensitive", "passive"。
+    markdown (str, optional): 推送内容的 Markdown 格式。如果传递了此参数，Bark 将忽略 body 字段。
     """
     api_url = "https://api.day.app/push" # 默认官方API
 
@@ -33,9 +34,13 @@ def send_bark_notification(device_key, body, title="", sound="", icon="", group=
 
 
     payload = {
-        "device_key": device_key,
-        "body": body
+        "device_key": device_key
     }
+
+    if markdown:
+        payload["markdown"] = markdown
+    else:
+        payload["body"] = body
 
     if title:
         payload["title"] = title
@@ -131,5 +136,16 @@ if __name__ == "__main__":
             url="https://www.python.org",
             icon="https://www.python.org/static/favicon.ico", # 图标URL必须是https
             group="Python脚本"
+        )
+        logger.info(f"发送结果: {'成功' if success else '失败'}, 响应: {result}")
+
+        # 示例 4: 发送 Markdown 通知
+        logger.info("\n--- 示例 4: 发送 Markdown 通知 ---")
+        success, result = send_bark_notification(
+            device_key=my_bark_key,
+            title="Markdown 测试",
+            body="如果看到这个，说明 Markdown 不生效",
+            markdown="## Markdown 标题\n这是一段 **加粗** 的文字，以及一个 [Python 链接](https://www.python.org)。",
+            group="Markdown测试"
         )
         logger.info(f"发送结果: {'成功' if success else '失败'}, 响应: {result}")
