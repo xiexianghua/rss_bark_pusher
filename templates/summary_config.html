@@ -23,15 +23,73 @@
         {% endwith %}
 
         <form method="POST" action="{{ url_for('summary_config') }}" class="bg-white p-6 rounded shadow-md mb-6">
+            <input type="hidden" name="csrf_token" id="csrf_token" value="{{ csrf_token }}">
+            <div class="mb-4">
+                <label for="ai_provider" class="block text-sm font-medium text-gray-700">AI 提供商:</label>
+                <select name="ai_provider" id="ai_provider" class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                    <option value="gemini" {% if not config or config.ai_provider == 'gemini' %}selected{% endif %}>Gemini</option>
+                    <option value="openai" {% if config and config.ai_provider == 'openai' %}selected{% endif %}>OpenAI</option>
+                </select>
+                <p class="mt-1 text-xs text-gray-500">每日总结和测试总结会使用这里选择的提供商。</p>
+            </div>
+
             <div class="mb-4">
                 <label for="gemini_api_key" class="block text-sm font-medium text-gray-700">Gemini API Key:</label>
                 <input type="text" name="gemini_api_key" id="gemini_api_key"
                        value="{{ '********' if config and config.gemini_api_key else '' }}"
                        placeholder="{{ '请输入 Gemini API Key' if not config or not config.gemini_api_key else '********' }}"
                        class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
-                {% if config and config.gemini_api_key %}
-                    <input type="hidden" name="gemini_api_key_hidden" value="{{ config.gemini_api_key }}">
-                {% endif %}
+            </div>
+
+            <div class="mb-4">
+                <label for="gemini_model" class="block text-sm font-medium text-gray-700">Gemini 模型:</label>
+                <div class="mt-1 flex flex-col md:flex-row gap-2">
+                    <input type="text" name="gemini_model" id="gemini_model"
+                           value="{{ config.gemini_model if config and config.gemini_model else 'gemini-2.5-flash' }}"
+                           placeholder="gemini-2.5-flash"
+                           class="block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                    <button type="button" id="fetch_gemini_models" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 md:whitespace-nowrap">获取可用模型</button>
+                </div>
+                <div id="gemini_model_options" class="hidden mt-3 bg-gray-50 border border-gray-200 rounded shadow-sm p-3">
+                    <div class="mb-2 text-xs font-medium text-gray-600">可用模型</div>
+                    <div id="gemini_model_list" class="flex flex-wrap gap-2"></div>
+                </div>
+                <p class="mt-1 text-xs text-gray-500">可直接填写模型名称；进入页面时不会自动请求 Gemini 模型列表，点击按钮后可从候选项中选择。</p>
+                <p id="gemini_model_status" class="mt-1 text-xs text-gray-500"></p>
+            </div>
+
+            <div class="mb-4">
+                <label for="openai_api_key" class="block text-sm font-medium text-gray-700">OpenAI API Key:</label>
+                <input type="text" name="openai_api_key" id="openai_api_key"
+                       value="{{ '********' if config and config.openai_api_key else '' }}"
+                       placeholder="{{ '请输入 OpenAI API Key' if not config or not config.openai_api_key else '********' }}"
+                       class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
+            </div>
+
+            <div class="mb-4">
+                <label for="openai_base_url" class="block text-sm font-medium text-gray-700">OpenAI Base URL:</label>
+                <input type="url" name="openai_base_url" id="openai_base_url"
+                       value="{{ config.openai_base_url if config and config.openai_base_url else '' }}"
+                       placeholder="https://api.openai.com/v1"
+                       class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                <p class="mt-1 text-xs text-gray-500">用于 OpenAI 兼容服务；留空时使用官方 OpenAI 默认地址。</p>
+            </div>
+
+            <div class="mb-4">
+                <label for="openai_model" class="block text-sm font-medium text-gray-700">OpenAI 模型:</label>
+                <div class="mt-1 flex flex-col md:flex-row gap-2">
+                    <input type="text" name="openai_model" id="openai_model"
+                           value="{{ config.openai_model if config and config.openai_model else 'gpt-4o-mini' }}"
+                           placeholder="gpt-4o-mini"
+                           class="block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
+                    <button type="button" id="fetch_openai_models" class="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 md:whitespace-nowrap">获取可用模型</button>
+                </div>
+                <div id="openai_model_options" class="hidden mt-3 bg-gray-50 border border-gray-200 rounded shadow-sm p-3">
+                    <div class="mb-2 text-xs font-medium text-gray-600">可用模型</div>
+                    <div id="openai_model_list" class="flex flex-wrap gap-2"></div>
+                </div>
+                <p class="mt-1 text-xs text-gray-500">可填写任意 OpenAI Chat Completions 兼容模型名称；点击按钮会使用填写的 API Key 和 Base URL 获取候选模型。</p>
+                <p id="openai_model_status" class="mt-1 text-xs text-gray-500"></p>
             </div>
 
             <div class="mb-4">
@@ -40,9 +98,6 @@
                        value="{{ '********' if config and config.summary_bark_key else '' }}"
                        placeholder="{{ '请输入总结通知 Bark Key' if not config or not config.summary_bark_key else '********' }}"
                        class="mt-1 block w-full border border-gray-300 rounded p-2 shadow-sm focus:ring-blue-500 focus:border-blue-500">
-                {% if config and config.summary_bark_key %}
-                    <input type="hidden" name="summary_bark_key_hidden" value="{{ config.summary_bark_key }}">
-                {% endif %}
             </div>
 
             <div class="mb-4">
@@ -123,5 +178,129 @@
             </div>
         {% endif %}
     </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            var csrfTokenInput = document.getElementById('csrf_token');
+
+            function createModelFetcher(settings) {
+                var fetchButton = document.getElementById(settings.buttonId);
+                var apiKeyInput = document.getElementById(settings.apiKeyId);
+                var baseUrlInput = settings.baseUrlId ? document.getElementById(settings.baseUrlId) : null;
+                var modelOptions = document.getElementById(settings.optionsId);
+                var modelList = document.getElementById(settings.listId);
+                var modelInput = document.getElementById(settings.modelId);
+                var statusText = document.getElementById(settings.statusId);
+
+                function setStatus(message, isError) {
+                    statusText.textContent = message;
+                    statusText.className = 'mt-1 text-xs ' + (isError ? 'text-red-600' : 'text-gray-500');
+                }
+
+                function updateSelectedModelStyle() {
+                    var currentModel = modelInput.value.trim();
+                    Array.prototype.forEach.call(modelList.querySelectorAll('button'), function (option) {
+                        var isSelected = option.getAttribute('data-model-name') === currentModel;
+                        option.className = isSelected
+                            ? 'px-3 py-2 text-sm text-green-700 bg-green-50 border border-green-400 rounded shadow-sm hover:bg-green-100 hover:border-green-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 active:bg-green-100'
+                            : 'px-3 py-2 text-sm text-gray-700 bg-white border border-gray-300 rounded shadow-sm hover:bg-green-50 hover:border-green-400 hover:text-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-opacity-50 active:bg-green-100';
+                    });
+                }
+
+                modelInput.addEventListener('input', updateSelectedModelStyle);
+
+                fetchButton.addEventListener('click', function () {
+                    var apiKey = apiKeyInput.value.trim();
+                    var csrfToken = csrfTokenInput ? csrfTokenInput.value : '';
+                    var requestPayload = {
+                        provider: settings.provider,
+                        csrf_token: csrfToken
+                    };
+
+                    if (apiKey && apiKey !== '********') {
+                        requestPayload[settings.apiKeyPayloadName] = apiKey;
+                    }
+                    if (settings.baseUrlPayloadName && baseUrlInput) {
+                        requestPayload[settings.baseUrlPayloadName] = baseUrlInput.value.trim();
+                    }
+
+                    fetchButton.disabled = true;
+                    fetchButton.textContent = '获取中...';
+                    fetchButton.classList.add('opacity-50', 'cursor-not-allowed');
+                    modelList.innerHTML = '';
+                    modelOptions.classList.add('hidden');
+                    setStatus('正在获取 ' + settings.label + ' 可用模型...', false);
+
+                    fetch("{{ url_for('summary_config_models') }}", {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-Token': csrfToken
+                        },
+                        body: JSON.stringify(requestPayload)
+                    })
+                        .then(function (response) {
+                            return response.json().then(function (data) {
+                                if (!response.ok || !data.success) {
+                                    throw new Error(data.message || '获取模型列表失败。');
+                                }
+                                return data;
+                            });
+                        })
+                        .then(function (data) {
+                            modelList.innerHTML = '';
+                            data.models.forEach(function (modelName) {
+                                var option = document.createElement('button');
+                                option.type = 'button';
+                                option.textContent = modelName;
+                                option.setAttribute('data-model-name', modelName);
+                                option.addEventListener('click', function () {
+                                    modelInput.value = modelName;
+                                    updateSelectedModelStyle();
+                                    setStatus('已选择模型：' + modelName, false);
+                                });
+                                modelList.appendChild(option);
+                            });
+                            updateSelectedModelStyle();
+                            modelOptions.classList.toggle('hidden', data.models.length === 0);
+                            setStatus('已加载 ' + data.models.length + ' 个模型，可点击选择或手动填写。', false);
+                        })
+                        .catch(function (error) {
+                            setStatus(error.message, true);
+                        })
+                        .finally(function () {
+                            fetchButton.disabled = false;
+                            fetchButton.textContent = '获取可用模型';
+                            fetchButton.classList.remove('opacity-50', 'cursor-not-allowed');
+                        });
+                });
+            }
+
+            createModelFetcher({
+                provider: 'gemini',
+                label: 'Gemini',
+                buttonId: 'fetch_gemini_models',
+                apiKeyId: 'gemini_api_key',
+                apiKeyPayloadName: 'gemini_api_key',
+                optionsId: 'gemini_model_options',
+                listId: 'gemini_model_list',
+                modelId: 'gemini_model',
+                statusId: 'gemini_model_status'
+            });
+
+            createModelFetcher({
+                provider: 'openai',
+                label: 'OpenAI',
+                buttonId: 'fetch_openai_models',
+                apiKeyId: 'openai_api_key',
+                apiKeyPayloadName: 'openai_api_key',
+                baseUrlId: 'openai_base_url',
+                baseUrlPayloadName: 'openai_base_url',
+                optionsId: 'openai_model_options',
+                listId: 'openai_model_list',
+                modelId: 'openai_model',
+                statusId: 'openai_model_status'
+            });
+        });
+    </script>
 </body>
 </html>

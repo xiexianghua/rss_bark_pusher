@@ -210,6 +210,31 @@ def _add_column_if_not_exists(conn, table_name, column_name, column_type):
     else:
         logger.debug(f"列 '{column_name}' 已存在于表 '{table_name}'。")
 
+def _get_table_columns(conn, table_name):
+    cursor = conn.execute(f"PRAGMA table_info({table_name})")
+    return [row['name'] for row in cursor.fetchall()]
+
+def _migrate_legacy_summary_provider_fields(conn):
+    columns = _get_table_columns(conn, "summary_config")
+    if 'api_key' in columns:
+        conn.execute('''
+            UPDATE summary_config
+            SET gemini_api_key = api_key
+            WHERE id = 1
+              AND (gemini_api_key IS NULL OR gemini_api_key = '')
+              AND api_key IS NOT NULL
+              AND api_key != ''
+        ''')
+    if 'model_name' in columns:
+        conn.execute('''
+            UPDATE summary_config
+            SET gemini_model = model_name
+            WHERE id = 1
+              AND (gemini_model IS NULL OR gemini_model = '')
+              AND model_name IS NOT NULL
+              AND model_name != ''
+        ''')
+
 def init_db():
     logger.info(f"正在初始化数据库: {DATABASE_FILE}")
     db_dir = os.path.dirname(DATABASE_FILE)
@@ -254,9 +279,19 @@ def init_db():
                     last_fetched_item_link TEXT,
                     is_active BOOLEAN NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
-                    last_checked_at TIMESTAMP
+                    last_checked_at TIMESTAMP,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_failure_at TIMESTAMP,
+                    last_failure_reason TEXT,
+                    failure_notified_at TIMESTAMP
                 )
             ''')
+
+            logger.info("正在检查并迁移 subscriptions 表结构...")
+            _add_column_if_not_exists(conn, "subscriptions", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0")
+            _add_column_if_not_exists(conn, "subscriptions", "last_failure_at", "TIMESTAMP")
+            _add_column_if_not_exists(conn, "subscriptions", "last_failure_reason", "TEXT")
+            _add_column_if_not_exists(conn, "subscriptions", "failure_notified_at", "TIMESTAMP")
 
             # 创建 feed_items 表
             conn.execute('''
@@ -277,8 +312,12 @@ def init_db():
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS summary_config (
                     id INTEGER PRIMARY KEY,
+                    ai_provider TEXT DEFAULT 'gemini',
                     gemini_api_key TEXT,
                     gemini_model TEXT,
+                    openai_api_key TEXT,
+                    openai_base_url TEXT,
+                    openai_model TEXT,
                     summary_prompt TEXT,
                     interval_hours INTEGER DEFAULT 24,
                     summary_bark_key TEXT, 
@@ -312,12 +351,17 @@ def init_db():
             ''')
 
             logger.info("正在检查并迁移 summary_config 表结构...")
+            _add_column_if_not_exists(conn, "summary_config", "ai_provider", "TEXT DEFAULT 'gemini'")
             _add_column_if_not_exists(conn, "summary_config", "gemini_api_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "gemini_model", "TEXT")
+            _add_column_if_not_exists(conn, "summary_config", "openai_api_key", "TEXT")
+            _add_column_if_not_exists(conn, "summary_config", "openai_base_url", "TEXT")
+            _add_column_if_not_exists(conn, "summary_config", "openai_model", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_prompt", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "summary_bark_key", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary", "TEXT")
             _add_column_if_not_exists(conn, "summary_config", "last_summary_at", "TIMESTAMP")
+            _migrate_legacy_summary_provider_fields(conn)
 
             conn.execute('''
                 INSERT OR IGNORE INTO summary_config (id, interval_hours) 
@@ -325,6 +369,14 @@ def init_db():
             ''')
             conn.execute('''
                 UPDATE summary_config SET interval_hours = COALESCE(interval_hours, 24) WHERE id = 1
+            ''')
+            conn.execute('''
+                UPDATE summary_config
+                SET ai_provider = CASE
+                    WHEN LOWER(COALESCE(ai_provider, '')) IN ('gemini', 'openai') THEN LOWER(ai_provider)
+                    ELSE 'gemini'
+                END
+                WHERE id = 1
             ''')
 
             # [新增] 初始化 MQTT 配置
@@ -396,13 +448,14 @@ if __name__ == '__main__':
             logger.info("验证 summary_config 表结构:")
             cursor = conn_test.execute("PRAGMA table_info(summary_config)")
             columns = [row['name'] for row in cursor.fetchall()]
-            expected_columns = ['id', 'gemini_api_key', 'summary_prompt', 'interval_hours', 'summary_bark_key', 'last_summary', 'last_summary_at']
+            expected_columns = ['id', 'ai_provider', 'gemini_api_key', 'gemini_model', 'openai_api_key', 'openai_base_url', 'openai_model', 'summary_prompt', 'interval_hours', 'summary_bark_key', 'last_summary', 'last_summary_at']
             for col in expected_columns:
                 assert col in columns, f"列 {col} 未在 summary_config 表中找到!"
             logger.info(f"summary_config 表列: {columns} - 验证通过")
 
             summary_row = conn_test.execute("SELECT * FROM summary_config WHERE id = 1").fetchone()
             assert summary_row is not None, "summary_config id=1 的默认行未找到"
+            assert summary_row['ai_provider'] == 'gemini', f"summary_config id=1 的 ai_provider ({summary_row['ai_provider']}) 不正确"
             assert summary_row['interval_hours'] == 24, f"summary_config id=1 的 interval_hours ({summary_row['interval_hours']}) 不正确"
             logger.info("summary_config 默认行和 interval_hours 验证通过。")
 

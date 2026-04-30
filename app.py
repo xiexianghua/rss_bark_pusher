@@ -4,11 +4,13 @@ import sqlite3
 import logging
 import gc
 import json
+import secrets
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 import feedparser
 import aiohttp
 import asyncio
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.base import JobLookupError
@@ -37,7 +39,14 @@ except ImportError:
     print("错误: 无法导入 google.genai。请确保已安装：pip install -q -U google-genai ")
     genai = None
     types = None
-    ClientError = None
+    class ClientError(Exception):
+        pass
+
+try:
+    from openai import OpenAI
+except ImportError:
+    print("错误: 无法导入 openai。请确保已安装：pip install openai")
+    OpenAI = None
 
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
@@ -48,6 +57,8 @@ from database import (
 
 APP_SECRET_KEY = os.environ.get('APP_SECRET_KEY', os.urandom(24))
 FEED_REQUEST_TIMEOUT = int(os.environ.get('FEED_REQUEST_TIMEOUT', 20))
+FEED_FAILURE_WARNING_THRESHOLD = int(os.environ.get('FEED_FAILURE_WARNING_THRESHOLD', 3))
+FEED_FAILURE_REMINDER_HOURS = int(os.environ.get('FEED_FAILURE_REMINDER_HOURS', 6))
 
 # --- 北京时区定义 ---
 BEIJING_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
@@ -218,8 +229,203 @@ def get_summary_config():
         logger.error(f"获取总结配置时发生数据库错误: {e}")
         return None
 
-def update_summary_config(api_key, gemini_model, prompt, interval_hours, summary_bark_key):
+def normalize_ai_provider(provider):
+    provider_value = (provider or 'gemini').strip().lower()
+    return provider_value if provider_value in ('gemini', 'openai') else 'gemini'
+
+def get_provider_display_name(provider):
+    return 'OpenAI' if normalize_ai_provider(provider) == 'openai' else 'Gemini'
+
+def get_summary_model_name(config_row, provider):
+    if normalize_ai_provider(provider) == 'openai':
+        return config_row['openai_model'] or os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+    return config_row['gemini_model'] or os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+
+def get_summary_api_key(config_row, provider):
+    if normalize_ai_provider(provider) == 'openai':
+        return config_row['openai_api_key']
+    return config_row['gemini_api_key']
+
+def get_openai_base_url(config_row):
+    return (config_row['openai_base_url'] or '').strip()
+
+def base_url_host_matches(base_url, expected_host):
+    if not base_url:
+        return False
+    parsed = urlparse(base_url if '://' in base_url else f"https://{base_url}")
+    host = (parsed.hostname or '').lower()
+    expected = expected_host.lower()
+    return host == expected or host.endswith(f".{expected}")
+
+def build_openai_client_kwargs(api_key, base_url=''):
+    client_kwargs = {'api_key': api_key}
+    normalized_base_url = (base_url or '').strip()
+    if normalized_base_url:
+        client_kwargs['base_url'] = normalized_base_url
+    if base_url_host_matches(normalized_base_url, 'manyrouter.chaosyn.com'):
+        client_kwargs['default_headers'] = {
+            'User-Agent': 'RSS-Bark-Pusher/1.5',
+            'X-Title': 'RSS Bark Pusher',
+        }
+    return client_kwargs
+
+def get_summary_config_csrf_token():
+    token = session.get('summary_config_csrf_token')
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session['summary_config_csrf_token'] = token
+    return token
+
+def validate_summary_config_csrf(token):
+    return bool(token) and secrets.compare_digest(token, session.get('summary_config_csrf_token', ''))
+
+def resolve_masked_secret(input_value, hidden_value=None, stored_value=''):
+    if input_value == '********':
+        return stored_value or ''
+    return input_value
+
+def build_summary_prompt(titles, prompt_template):
+    sub_titles = {}
+    for title_row_item in titles:
+        sub_name = title_row_item['name']
+        if sub_name not in sub_titles:
+            sub_titles[sub_name] = []
+        sub_titles[sub_name].append(title_row_item['title'])
+
+    formatted_titles_list = []
+    for sub_name, sub_feed_titles in sub_titles.items():
+        formatted_titles_list.append(f"{sub_name}: {', '.join(sub_feed_titles)}")
+    formatted_titles_string = "\n".join(formatted_titles_list)
+
+    template = prompt_template or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
+    return template.replace("{sub_titles}", formatted_titles_string)
+
+def split_summary_text(summary_text, chunk_size=1000):
+    text = summary_text or ''
+    if not text:
+        return ['暂无总结内容。']
+
+    chunks = []
+    current = ''
+
+    def append_current():
+        nonlocal current
+        chunk = current.strip()
+        if chunk:
+            chunks.append(chunk)
+        current = ''
+
+    def append_piece(piece):
+        nonlocal current
+        if not piece:
+            return
+        separator = '\n\n' if current else ''
+        if len(current) + len(separator) + len(piece) <= chunk_size:
+            current = f"{current}{separator}{piece}" if current else piece
+            return
+        append_current()
+        if len(piece) <= chunk_size:
+            current = piece
+            return
+        for start in range(0, len(piece), chunk_size):
+            sub_piece = piece[start:start + chunk_size].strip()
+            if sub_piece:
+                chunks.append(sub_piece)
+
+    for paragraph in text.split('\n\n'):
+        stripped_paragraph = paragraph.strip()
+        if not stripped_paragraph:
+            continue
+        append_piece(stripped_paragraph)
+
+    append_current()
+    return chunks or ['暂无总结内容。']
+
+def send_summary_bark_notification(device_key, title, summary_text):
+    chunks = split_summary_text(summary_text)
+    total_parts = len(chunks)
+    responses = []
+    aggregate_success = True
+
+    for index, chunk in enumerate(chunks, start=1):
+        part_title = title if total_parts == 1 else f"{title} ({index}/{total_parts})"
+        success, response_data = send_bark_notification(
+            device_key=device_key,
+            title=part_title,
+            body="",
+            markdown=chunk,
+            sound="glass",
+            group="每日总结"
+        )
+        responses.append({
+            'part': index,
+            'total': total_parts,
+            'title': part_title,
+            'success': success,
+            'response': response_data
+        })
+        if success:
+            logger.info(f"总结 Bark 通知第 {index}/{total_parts} 部分发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
+        else:
+            aggregate_success = False
+            logger.error(f"总结 Bark 通知第 {index}/{total_parts} 部分发送失败。错误: {response_data.get('message', response_data.get('error', '未知错误'))}")
+
+    return aggregate_success, {'parts': responses, 'total_parts': total_parts}
+
+def extract_model_ids(models_response):
+    model_entries = getattr(models_response, 'data', None) or models_response
+    models = []
+    for model in model_entries:
+        model_id = getattr(model, 'id', None) or getattr(model, 'name', None)
+        if not model_id and isinstance(model, dict):
+            model_id = model.get('id') or model.get('name')
+        if not model_id and isinstance(model, str):
+            model_id = model
+        if model_id:
+            models.append(str(model_id))
+    return sorted(set(models))
+
+def generate_summary_with_provider(config_row, final_prompt):
+    provider = normalize_ai_provider(config_row['ai_provider'])
+    provider_name = get_provider_display_name(provider)
+    model_name = get_summary_model_name(config_row, provider)
+    api_key = get_summary_api_key(config_row, provider)
+
+    if not api_key:
+        raise ValueError(f"未配置 {provider_name} API Key")
+
+    if provider == 'openai':
+        if not OpenAI:
+            raise RuntimeError("OpenAI SDK 未加载，无法生成总结。请安装 openai 依赖。")
+        client = OpenAI(**build_openai_client_kwargs(api_key, get_openai_base_url(config_row)))
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{'role': 'user', 'content': final_prompt}],
+            temperature=0.3
+        )
+        summary_text = response.choices[0].message.content if response.choices else ''
+    else:
+        if not genai or not types:
+            raise RuntimeError("Gemini SDK 未加载，无法生成总结。请安装 google-genai 依赖。")
+        client = genai.Client(api_key=api_key)
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config = types.GenerateContentConfig(tools=[grounding_tool])
+        response = client.models.generate_content(
+            model=model_name,
+            contents=final_prompt,
+            config=config,
+        )
+        summary_text = response.text
+
+    if not summary_text:
+        raise RuntimeError(f"{provider_name} 未返回总结内容。")
+
+    logger.info(f"{provider_name} API 成功生成总结 (Model: {model_name})。\n")
+    return summary_text, provider_name, model_name
+
+def update_summary_config(ai_provider, gemini_api_key, gemini_model, openai_api_key, openai_base_url, openai_model, prompt, interval_hours, summary_bark_key):
     try:
+        normalized_provider = normalize_ai_provider(ai_provider)
         with get_db_connection() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO summary_config (id, interval_hours) 
@@ -227,16 +433,20 @@ def update_summary_config(api_key, gemini_model, prompt, interval_hours, summary
             )
             conn.execute(
                 """UPDATE summary_config
-                   SET gemini_api_key = ?,
+                   SET ai_provider = ?,
+                       gemini_api_key = ?,
                        gemini_model = ?,
+                       openai_api_key = ?,
+                       openai_base_url = ?,
+                       openai_model = ?,
                        summary_prompt = ?,
                        interval_hours = ?,
                        summary_bark_key = ?
                    WHERE id = 1""",
-                (api_key, gemini_model, prompt, interval_hours, summary_bark_key)
+                (normalized_provider, gemini_api_key, gemini_model, openai_api_key, openai_base_url, openai_model, prompt, interval_hours, summary_bark_key)
             )
             conn.commit()
-            logger.info(f"总结配置已更新: API Key (已设置: {'是' if api_key else '否'}), Model: {gemini_model}, Interval: {interval_hours}h, Bark Key (已设置: {'是' if summary_bark_key else '否'})")
+            logger.info(f"总结配置已更新: Provider: {normalized_provider}, Gemini Key (已设置: {'是' if gemini_api_key else '否'}), Gemini Model: {gemini_model}, OpenAI Key (已设置: {'是' if openai_api_key else '否'}), OpenAI Base URL: {openai_base_url or '默认'}, OpenAI Model: {openai_model}, Interval: {interval_hours}h, Bark Key (已设置: {'是' if summary_bark_key else '否'})")
             return True
     except sqlite3.Error as e:
         logger.error(f"更新总结配置时发生数据库错误: {e}")
@@ -323,16 +533,129 @@ async def fetch_feed_content(url, sub_id):
                 response.raise_for_status()
                 content = await response.read()
                 logger.debug(f"成功获取订阅内容，字节数: {len(content)}")
-                return content
+                return content, None
         except asyncio.TimeoutError:
+            error_reason = f"请求超时（超过 {FEED_REQUEST_TIMEOUT} 秒）"
             logger.error(f"抓取订阅 {url} 超时 (超过 {FEED_REQUEST_TIMEOUT} 秒)。")
-            return None
+            return None, error_reason
         except aiohttp.ClientResponseError as e:
+            error_reason = f"HTTP {e.status}: {e.message}"
             logger.error(f"抓取订阅 {url} 时发生 HTTP 错误: {e.status} {e.message}")
-            return None
+            return None, error_reason
         except aiohttp.ClientError as e:
+            error_reason = f"请求失败: {e}"
             logger.error(f"抓取订阅 {url} 失败: {e}")
-            return None
+            return None, error_reason
+
+def should_send_failure_warning(consecutive_failures, failure_notified_at, now_utc):
+    if consecutive_failures < FEED_FAILURE_WARNING_THRESHOLD:
+        return False
+    if failure_notified_at is None:
+        return True
+    reminder_interval = timedelta(hours=FEED_FAILURE_REMINDER_HOURS)
+    return now_utc - failure_notified_at >= reminder_interval
+
+def mark_subscription_failure_notified(sub_id, notified_at):
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "UPDATE subscriptions SET failure_notified_at = ? WHERE id = ?",
+                (notified_at, sub_id)
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"更新订阅 {sub_id} 的失败提醒时间时发生数据库错误: {e}")
+
+def handle_feed_fetch_failure(sub, error_reason):
+    now_utc = datetime.now(timezone.utc)
+    consecutive_failures = (sub['consecutive_failures'] or 0) + 1
+
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                """UPDATE subscriptions
+                   SET consecutive_failures = ?,
+                       last_failure_at = ?,
+                       last_failure_reason = ?
+                   WHERE id = ?""",
+                (consecutive_failures, now_utc, error_reason, sub['id'])
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"记录订阅 {sub['name']} 抓取失败状态时发生数据库错误: {e}")
+        return
+
+    logger.info(f"订阅 {sub['name']} 已连续抓取失败 {consecutive_failures} 次。原因: {error_reason}")
+
+    if not should_send_failure_warning(consecutive_failures, sub['failure_notified_at'], now_utc):
+        return
+
+    title = f"RSS订阅抓取异常：{sub['name']}"
+    body = (
+        f"订阅已连续抓取失败 {consecutive_failures} 次。\n"
+        f"原因：{error_reason}\n"
+        f"地址：{sub['url']}\n"
+        f"后续仍失败时，每 {FEED_FAILURE_REMINDER_HOURS} 小时最多提醒一次；恢复后会自动通知。"
+    )
+    success, response_data = send_bark_notification(
+        device_key=sub['bark_key'],
+        title=title,
+        body=body[:500],
+        url=sub['url'],
+        sound="glass",
+        group=f"订阅异常-{sub['name']}"
+    )
+    if success:
+        mark_subscription_failure_notified(sub['id'], now_utc)
+        logger.info(f"订阅 {sub['name']} 抓取异常 Bark 提醒已发送。")
+    else:
+        logger.error(f"订阅 {sub['name']} 抓取异常 Bark 提醒发送失败: {response_data.get('message', '未知错误')}")
+
+def reset_subscription_failure_state_if_needed(sub):
+    consecutive_failures = sub['consecutive_failures'] or 0
+    failure_notified_at = sub['failure_notified_at']
+    if consecutive_failures == 0 and failure_notified_at is None:
+        return
+
+    should_send_recovery = failure_notified_at is not None
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                """UPDATE subscriptions
+                   SET consecutive_failures = 0,
+                       last_failure_at = NULL,
+                       last_failure_reason = NULL,
+                       failure_notified_at = NULL
+                   WHERE id = ?""",
+                (sub['id'],)
+            )
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"重置订阅 {sub['name']} 抓取失败状态时发生数据库错误: {e}")
+        return
+
+    logger.info(f"订阅 {sub['name']} 抓取已恢复，失败状态已清零。")
+    if not should_send_recovery:
+        return
+
+    title = f"RSS订阅已恢复：{sub['name']}"
+    body = (
+        f"订阅抓取已恢复正常。\n"
+        f"此前连续失败次数：{consecutive_failures}\n"
+        f"地址：{sub['url']}"
+    )
+    success, response_data = send_bark_notification(
+        device_key=sub['bark_key'],
+        title=title,
+        body=body[:500],
+        url=sub['url'],
+        sound="glass",
+        group=f"订阅异常-{sub['name']}"
+    )
+    if success:
+        logger.info(f"订阅 {sub['name']} 恢复 Bark 提醒已发送。")
+    else:
+        logger.error(f"订阅 {sub['name']} 恢复 Bark 提醒发送失败: {response_data.get('message', '未知错误')}")
 
 def process_feed(subscription_id, is_test_run=False):
     sub = get_subscription_by_id(subscription_id)
@@ -345,11 +668,16 @@ def process_feed(subscription_id, is_test_run=False):
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    feed_content = loop.run_until_complete(fetch_feed_content(sub['url'], sub['id']))
+    feed_content, fetch_error = loop.run_until_complete(fetch_feed_content(sub['url'], sub['id']))
     loop.close()
 
     if feed_content is None:
+        if not is_test_run:
+            handle_feed_fetch_failure(sub, fetch_error or "未知抓取错误")
         return
+
+    if not is_test_run:
+        reset_subscription_failure_state_if_needed(sub)
 
     feed_data = feedparser.parse(feed_content)
     if feed_data.bozo:
@@ -568,17 +896,25 @@ def process_feed(subscription_id, is_test_run=False):
     del feed_data
     gc.collect()
 
-# --- Gemini Summary Processing ---
+# --- AI Summary Processing ---
 def generate_daily_summary():
     config_row = get_summary_config()
-    if not config_row or not config_row['gemini_api_key']:
-        logger.warning("未配置 Gemini API Key，跳过每日总结。\n")
+    if not config_row:
+        logger.warning("未配置总结参数，跳过每日总结。\n")
+        return
+    provider = normalize_ai_provider(config_row['ai_provider'])
+    provider_name = get_provider_display_name(provider)
+    if not get_summary_api_key(config_row, provider):
+        logger.warning(f"未配置 {provider_name} API Key，跳过每日总结。\n")
         return
     if not config_row['summary_bark_key']:
         logger.warning("未配置总结 Bark Key，跳过每日总结通知。\n")
         return
-    if not genai or not types:
-        logger.error("Gemini 库未加载，无法生成总结。\n")
+    if provider == 'gemini' and (not genai or not types):
+        logger.error("Gemini SDK 未加载，无法生成总结。\n")
+        return
+    if provider == 'openai' and not OpenAI:
+        logger.error("OpenAI SDK 未加载，无法生成总结。请安装 openai 依赖。\n")
         return
 
     titles = get_daily_feed_titles()
@@ -587,51 +923,19 @@ def generate_daily_summary():
         logger.info(f"过去{interval_hours}小时内没有新订阅标题，跳过总结。\n")
         return
 
-    sub_titles = {}
-    for title_row_item in titles:
-        sub_name = title_row_item['name']
-        if sub_name not in sub_titles:
-            sub_titles[sub_name] = []
-        sub_titles[sub_name].append(title_row_item['title'])
-
-    prompt_template = config_row['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
-    
-    formatted_titles_list = []
-    for sub_name, sub_feed_titles in sub_titles.items():
-        formatted_titles_list.append(f"{sub_name}: {', '.join(sub_feed_titles)}")
-    formatted_titles_string = "\n".join(formatted_titles_list)
-    
-    final_prompt = prompt_template.replace("{sub_titles}", formatted_titles_string)
+    final_prompt = build_summary_prompt(titles, config_row['summary_prompt'])
 
     try:
-        client = genai.Client(api_key=config_row['gemini_api_key'])
-        grounding_tool = types.Tool(google_search=types.GoogleSearch())
-        config = types.GenerateContentConfig(tools=[grounding_tool])
-        
-        model_name = config_row['gemini_model']
-        if not model_name:
-            model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
-            
-        response = client.models.generate_content(
-            model=model_name,
-            contents=final_prompt,
-            config=config,
-        )
-        summary_text = response.text
-        logger.info(f"Gemini API 成功生成总结 (Model: {model_name})。\n")
-
+        summary_text, provider_name, model_name = generate_summary_with_provider(config_row, final_prompt)
         save_summary_result(summary_text)
 
-        success, response_data = send_bark_notification(
+        success, response_data = send_summary_bark_notification(
             device_key=config_row['summary_bark_key'],
             title="每日RSS总结",
-            body="",
-            markdown=summary_text[:2000],
-            sound="glass",
-            group="每日总结"
+            summary_text=summary_text
         )
         if success:
-            logger.info(f"每日总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
+            logger.info(f"每日总结 Bark 通知发送成功，共 {response_data.get('total_parts', 0)} 部分。")
             mqtt_payload = {
                 'source': 'daily_summary',
                 'title': "每日RSS总结",
@@ -639,14 +943,14 @@ def generate_daily_summary():
             }
             send_mqtt_notification(mqtt_payload)
         else:
-            logger.error(f"每日总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
+            logger.error(f"每日总结 Bark 通知发送失败。部分响应: {response_data}")
     except ClientError as e:
         if e.code == 429:
-             logger.warning(f"Gemini API 限额已达 (429). 请检查配额或稍后再试。错误信息: {e.message}")
+             logger.warning(f"{provider_name} API 限额已达 (429). 请检查配额或稍后再试。错误信息: {e.message}")
         else:
-             logger.error(f"调用 Gemini API 失败 (ClientError): {e}", exc_info=True)
+             logger.error(f"调用 {provider_name} API 失败 (ClientError): {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"调用 Gemini API 生成总结失败: {e}", exc_info=True)
+        logger.error(f"调用 {provider_name} API 生成总结失败: {e}", exc_info=True)
     finally:
         gc.collect()
 
@@ -1007,38 +1311,45 @@ def delete_keyword(keyword_id):
 @app.route('/summary_config', methods=['GET', 'POST'])
 def summary_config():
     db_config_row = get_summary_config()
+    csrf_token = get_summary_config_csrf_token()
     
     if db_config_row:
         current_config_dict = dict(db_config_row)
     else:
         current_config_dict = {
-            'id': 1, 'gemini_api_key': None, 'gemini_model': None, 'summary_prompt': None, 
+            'id': 1, 'ai_provider': 'gemini', 'gemini_api_key': None, 'gemini_model': None,
+            'openai_api_key': None, 'openai_base_url': None, 'openai_model': None, 'summary_prompt': None,
             'interval_hours': 24, 'summary_bark_key': None, 
             'last_summary': None, 'last_summary_at': None
         }
+    current_config_dict['ai_provider'] = normalize_ai_provider(current_config_dict.get('ai_provider'))
+    if not current_config_dict.get('gemini_model'):
+        current_config_dict['gemini_model'] = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
+    if not current_config_dict.get('openai_model'):
+        current_config_dict['openai_model'] = os.environ.get('OPENAI_MODEL_NAME', 'gpt-4o-mini')
 
     if request.method == 'POST':
+        if not validate_summary_config_csrf(request.form.get('csrf_token', '')):
+            flash('表单已过期，请刷新页面后重试。', 'error')
+            return redirect(url_for('summary_config'))
+
         db_gemini_key = current_config_dict.get('gemini_api_key', '')
+        db_openai_key = current_config_dict.get('openai_api_key', '')
         db_summary_bark_key = current_config_dict.get('summary_bark_key', '')
 
+        ai_provider_from_form = normalize_ai_provider(request.form.get('ai_provider', current_config_dict.get('ai_provider', 'gemini')))
         form_gemini_api_key_input = request.form.get('gemini_api_key', '').strip()
+        form_openai_api_key_input = request.form.get('openai_api_key', '').strip()
         form_summary_bark_key_input = request.form.get('summary_bark_key', '').strip()
         
-        form_gemini_api_key_hidden = request.form.get('gemini_api_key_hidden', '').strip()
-        form_summary_bark_key_hidden = request.form.get('summary_bark_key_hidden', '').strip()
-
-        if form_gemini_api_key_input == '********':
-            actual_gemini_api_key = form_gemini_api_key_hidden 
-        else:
-            actual_gemini_api_key = form_gemini_api_key_input
-
-        if form_summary_bark_key_input == '********':
-            actual_summary_bark_key = form_summary_bark_key_hidden
-        else:
-            actual_summary_bark_key = form_summary_bark_key_input
+        actual_gemini_api_key = resolve_masked_secret(form_gemini_api_key_input, stored_value=db_gemini_key)
+        actual_openai_api_key = resolve_masked_secret(form_openai_api_key_input, stored_value=db_openai_key)
+        actual_summary_bark_key = resolve_masked_secret(form_summary_bark_key_input, stored_value=db_summary_bark_key)
         
         summary_prompt_from_form = request.form.get('summary_prompt', '').strip()
         gemini_model_from_form = request.form.get('gemini_model', '').strip()
+        openai_base_url_from_form = request.form.get('openai_base_url', '').strip()
+        openai_model_from_form = request.form.get('openai_model', '').strip()
         interval_hours_str_from_form = request.form.get('interval_hours', '24').strip()
 
         try:
@@ -1047,26 +1358,34 @@ def summary_config():
                 flash('总结间隔不能小于1小时。', 'error')
                 form_data_for_render = current_config_dict.copy()
                 form_data_for_render.update({
+                    'ai_provider': ai_provider_from_form,
                     'gemini_api_key': actual_gemini_api_key, 
                     'gemini_model': gemini_model_from_form,
+                    'openai_api_key': actual_openai_api_key,
+                    'openai_base_url': openai_base_url_from_form,
+                    'openai_model': openai_model_from_form,
                     'summary_prompt': summary_prompt_from_form,
                     'interval_hours': interval_hours_str_from_form,
                     'summary_bark_key': actual_summary_bark_key
                 })
-                return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False)
+                return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False, csrf_token=csrf_token)
         except ValueError:
             flash('总结间隔必须是有效的数字。', 'error')
             form_data_for_render = current_config_dict.copy()
             form_data_for_render.update({
+                'ai_provider': ai_provider_from_form,
                 'gemini_api_key': actual_gemini_api_key,
                 'gemini_model': gemini_model_from_form,
+                'openai_api_key': actual_openai_api_key,
+                'openai_base_url': openai_base_url_from_form,
+                'openai_model': openai_model_from_form,
                 'summary_prompt': summary_prompt_from_form,
                 'interval_hours': interval_hours_str_from_form,
                 'summary_bark_key': actual_summary_bark_key
             })
-            return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False)
+            return render_template('summary_config.html', config=form_data_for_render, show_items_area=False, show_summary_area=False, csrf_token=csrf_token)
 
-        if update_summary_config(actual_gemini_api_key, gemini_model_from_form, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
+        if update_summary_config(ai_provider_from_form, actual_gemini_api_key, gemini_model_from_form, actual_openai_api_key, openai_base_url_from_form, openai_model_from_form, summary_prompt_from_form, interval_hours_val, actual_summary_bark_key):
             schedule_summary_job()
             flash('总结配置已更新并重新调度。', 'success')
         else:
@@ -1076,20 +1395,6 @@ def summary_config():
     feed_items_to_display = None 
     show_items_area_flag = False
     show_summary_area_flag = False
-    available_models = []
-    
-    # Fetch available models if API key is present
-    api_key_for_models = current_config_dict.get('gemini_api_key')
-    if api_key_for_models and genai:
-        try:
-            client = genai.Client(api_key=api_key_for_models)
-            for model in client.models.list():
-                if 'generateContent' in model.supported_actions:
-                    available_models.append(model.name.replace('models/', ''))
-            available_models.sort()
-        except Exception as e:
-            logger.error(f"获取模型列表失败: {e}")
-            # Don't flash error here to avoid annoyance on every page load if key is invalid/expired temporarily
 
     if request.args.get('show_items', 'false').lower() == 'true':
         show_items_area_flag = True
@@ -1111,19 +1416,99 @@ def summary_config():
                            feed_items_for_summary=feed_items_to_display, 
                            show_items_area=show_items_area_flag,
                            show_summary_area=show_summary_area_flag,
-                           available_models=available_models)
+                           csrf_token=csrf_token)
+
+@app.route('/summary_config/models', methods=['POST'])
+def summary_config_models():
+    payload = request.get_json(silent=True) or request.form
+    csrf_token = request.headers.get('X-CSRF-Token') or payload.get('csrf_token') or ''
+    if not validate_summary_config_csrf(csrf_token):
+        return jsonify({'success': False, 'message': '请求已过期，请刷新页面后重试。'}), 400
+
+    provider = normalize_ai_provider(payload.get('provider', 'gemini'))
+    db_config_row = get_summary_config()
+
+    if provider == 'openai':
+        if not OpenAI:
+            return jsonify({'success': False, 'message': 'OpenAI SDK 未加载，无法获取模型列表。'}), 500
+
+        api_key_input = (payload.get('openai_api_key') or '').strip()
+        stored_api_key = db_config_row['openai_api_key'] if db_config_row and db_config_row['openai_api_key'] else ''
+        api_key = stored_api_key if api_key_input == '********' or not api_key_input else api_key_input
+
+        if not api_key:
+            return jsonify({'success': False, 'message': '请先填写 OpenAI API Key。'}), 400
+
+        has_base_url_payload = 'openai_base_url' in payload
+        base_url_input = (payload.get('openai_base_url') or '').strip()
+        stored_base_url = db_config_row['openai_base_url'] if db_config_row and db_config_row['openai_base_url'] else ''
+        openai_base_url = base_url_input if has_base_url_payload else stored_base_url
+
+        try:
+            client = OpenAI(**build_openai_client_kwargs(api_key, openai_base_url))
+            models = extract_model_ids(client.models.list())
+            if not models:
+                return jsonify({'success': False, 'message': '没有找到可用的 OpenAI 模型。'}), 404
+
+            return jsonify({'success': True, 'models': models})
+        except Exception as e:
+            logger.error(f"获取 OpenAI 模型列表失败: {e}", exc_info=True)
+            return jsonify({'success': False, 'message': '获取 OpenAI 模型列表失败，请检查 API Key、Base URL、网络或应用日志。'}), 502
+
+    if not genai:
+        return jsonify({'success': False, 'message': 'Gemini SDK 未加载，无法获取模型列表。'}), 500
+
+    api_key_input = (payload.get('gemini_api_key') or '').strip()
+
+    stored_api_key = db_config_row['gemini_api_key'] if db_config_row and db_config_row['gemini_api_key'] else ''
+
+    if api_key_input == '********' or not api_key_input:
+        api_key = stored_api_key
+    else:
+        api_key = api_key_input
+
+    if not api_key:
+        return jsonify({'success': False, 'message': '请先填写 Gemini API Key。'}), 400
+
+    try:
+        client = genai.Client(api_key=api_key)
+        models = []
+        for model in client.models.list():
+            supported_actions = getattr(model, 'supported_actions', []) or []
+            if 'generateContent' in supported_actions:
+                models.append(model.name.replace('models/', ''))
+
+        models = sorted(set(models))
+        if not models:
+            return jsonify({'success': False, 'message': '没有找到支持生成内容的 Gemini 模型。'}), 404
+
+        return jsonify({'success': True, 'models': models})
+    except ClientError as e:
+        logger.warning(f"获取 Gemini 模型列表失败 (ClientError): {e}")
+        return jsonify({'success': False, 'message': '获取 Gemini 模型列表失败，请检查 API Key、网络或应用日志。'}), 502
+    except Exception as e:
+        logger.error(f"获取 Gemini 模型列表失败: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': '获取 Gemini 模型列表失败，请检查 API Key、网络或应用日志。'}), 502
 
 @app.route('/test_summary')
 def test_summary():
     config_row = get_summary_config()
-    if not config_row or not config_row['gemini_api_key']:
-        flash('未配置 Gemini API Key，无法测试总结。', 'error')
+    if not config_row:
+        flash('未配置总结参数，无法测试总结。', 'error')
+        return redirect(url_for('summary_config'))
+    provider = normalize_ai_provider(config_row['ai_provider'])
+    provider_name = get_provider_display_name(provider)
+    if not get_summary_api_key(config_row, provider):
+        flash(f'未配置 {provider_name} API Key，无法测试总结。', 'error')
         return redirect(url_for('summary_config'))
     if not config_row['summary_bark_key']:
         flash('未配置总结 Bark Key，无法测试总结通知。', 'error')
         return redirect(url_for('summary_config'))
-    if not genai or not types:
-        flash("Gemini 库未加载，无法测试总结。", "error")
+    if provider == 'gemini' and (not genai or not types):
+        flash("Gemini SDK 未加载，无法测试总结。", "error")
+        return redirect(url_for('summary_config'))
+    if provider == 'openai' and not OpenAI:
+        flash("OpenAI SDK 未加载，无法测试总结。请安装 openai 依赖。", "error")
         return redirect(url_for('summary_config'))
 
     titles = get_daily_feed_titles()
@@ -1132,52 +1517,20 @@ def test_summary():
         flash(f'过去{interval_hours}小时内没有新订阅标题，无法生成测试总结。', 'info')
         return redirect(url_for('summary_config'))
 
-    sub_titles = {}
-    for title_row_item in titles:
-        sub_name = title_row_item['name']
-        if sub_name not in sub_titles:
-            sub_titles[sub_name] = []
-        sub_titles[sub_name].append(title_row_item['title'])
-
-    prompt_template = config_row['summary_prompt'] or "请用简洁的中文总结以下RSS订阅的标题内容，突出每组订阅的关键点，分组显示：\n\n{sub_titles}"
-    
-    formatted_titles_list = []
-    for sub, sub_feed_titles in sub_titles.items():
-        formatted_titles_list.append(f"{sub}: {', '.join(sub_feed_titles)}")
-    formatted_titles_string = "\n".join(formatted_titles_list)
-    
-    final_prompt = prompt_template.replace("{sub_titles}", formatted_titles_string)
+    final_prompt = build_summary_prompt(titles, config_row['summary_prompt'])
     logger.info(f"测试总结使用的最终提示词: {final_prompt[:500]}...\n")
 
     try:
-        client = genai.Client(api_key=config_row['gemini_api_key'])
-        grounding_tool = types.Tool(google_search=types.GoogleSearch())
-        config = types.GenerateContentConfig(tools=[grounding_tool])
-        
-        model_name = config_row['gemini_model']
-        if not model_name:
-             model_name = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash')
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=final_prompt,
-            config=config,
-        )
-        summary_text = response.text
-        logger.info(f"Gemini API 成功生成测试总结 (Model: {model_name})。\n")
-        
+        summary_text, provider_name, model_name = generate_summary_with_provider(config_row, final_prompt)
         save_summary_result(summary_text)
 
-        success, response_data = send_bark_notification(
+        success, response_data = send_summary_bark_notification(
             device_key=config_row['summary_bark_key'],
             title="[测试] 每日RSS总结",
-            body="",
-            markdown=summary_text[:2000],
-            sound="glass",
-            group="每日总结"
+            summary_text=summary_text
         )
         if success:
-            logger.info(f"测试总结 Bark 通知发送成功。Message ID: {response_data.get('messageid', 'N/A')}")
+            logger.info(f"测试总结 Bark 通知发送成功，共 {response_data.get('total_parts', 0)} 部分。")
             flash('测试总结已生成并发送，请检查Bark设备。总结结果已更新到页面。', 'success')
             
             mqtt_payload = {
@@ -1190,19 +1543,19 @@ def test_summary():
 
             return redirect(url_for('summary_config', show_summary='true')) 
         else:
-            logger.error(f"测试总结 Bark 通知发送失败。错误: {response_data.get('message', '未知错误')}")
+            logger.error(f"测试总结 Bark 通知发送失败。部分响应: {response_data}")
             flash('测试总结通知发送失败，请检查日志。总结结果仍会更新到页面。', 'warning')
             return redirect(url_for('summary_config', show_summary='true'))
     except ClientError as e:
         if e.code == 429:
-            logger.warning(f"测试总结失败: Gemini API 限额已达 (429)。{e.message}")
-            flash(f"Gemini API 限额已达，请稍后再试。详细信息已记录到日志。", 'warning')
+            logger.warning(f"测试总结失败: {provider_name} API 限额已达 (429)。{e.message}")
+            flash(f"{provider_name} API 限额已达，请稍后再试。详细信息已记录到日志。", 'warning')
             return redirect(url_for('summary_config', show_summary='true'))
         else:
-            logger.error(f"测试总结失败 (ClientError): {e}", exc_info=True)
-            flash(f"测试总结失败 (API Error): {e}", 'error')
+            logger.error(f"测试总结失败 ({provider_name} ClientError): {e}", exc_info=True)
+            flash(f"测试总结失败 ({provider_name} API Error): {e}", 'error')
     except Exception as e:
-        logger.error(f"测试总结失败: {e}", exc_info=True)
+        logger.error(f"测试总结失败 ({provider_name}): {e}", exc_info=True)
         flash(f"测试总结失败: {e}", 'error')
 
     return redirect(url_for('summary_config'))
