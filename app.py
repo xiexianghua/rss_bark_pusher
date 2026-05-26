@@ -31,22 +31,42 @@ except ImportError:
         print(f"Other args: {kwargs}")
         return True, {"messageid": "dummy_id", "code": 200, "message": "Dummy success"}
 
-try:
-    from google import genai
-    from google.genai import types
-    from google.genai.errors import ClientError
-except ImportError:
-    print("错误: 无法导入 google.genai。请确保已安装：pip install -q -U google-genai ")
-    genai = None
-    types = None
-    class ClientError(Exception):
-        pass
+genai = None
+types = None
+OpenAI = None
 
-try:
-    from openai import OpenAI
-except ImportError:
-    print("错误: 无法导入 openai。请确保已安装：pip install openai")
-    OpenAI = None
+class ClientError(Exception):
+    pass
+
+def load_gemini_sdk():
+    global genai, types, ClientError
+    if genai and types:
+        return genai, types, ClientError
+
+    try:
+        from google import genai as imported_genai
+        from google.genai import types as imported_types
+        from google.genai.errors import ClientError as imported_client_error
+    except ImportError as e:
+        raise RuntimeError("Gemini SDK 未加载，无法生成总结。请安装 google-genai 依赖。") from e
+
+    genai = imported_genai
+    types = imported_types
+    ClientError = imported_client_error
+    return genai, types, ClientError
+
+def load_openai_sdk():
+    global OpenAI
+    if OpenAI:
+        return OpenAI
+
+    try:
+        from openai import OpenAI as imported_openai
+    except ImportError as e:
+        raise RuntimeError("OpenAI SDK 未加载，无法生成总结。请安装 openai 依赖。") from e
+
+    OpenAI = imported_openai
+    return OpenAI
 
 from database import (
     get_db_connection, init_db, cleanup_old_feed_items, DATABASE_FILE, _db_lock,
@@ -403,8 +423,7 @@ def generate_summary_with_provider(config_row, final_prompt):
         raise ValueError(f"未配置 {provider_name} API Key")
 
     if provider == 'openai':
-        if not OpenAI:
-            raise RuntimeError("OpenAI SDK 未加载，无法生成总结。请安装 openai 依赖。")
+        OpenAI = load_openai_sdk()
         client = OpenAI(**build_openai_client_kwargs(api_key, get_openai_base_url(config_row)))
         response = client.chat.completions.create(
             model=model_name,
@@ -413,8 +432,7 @@ def generate_summary_with_provider(config_row, final_prompt):
         )
         summary_text = response.choices[0].message.content if response.choices else ''
     else:
-        if not genai or not types:
-            raise RuntimeError("Gemini SDK 未加载，无法生成总结。请安装 google-genai 依赖。")
+        genai, types, _ = load_gemini_sdk()
         client = genai.Client(api_key=api_key)
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         config = types.GenerateContentConfig(tools=[grounding_tool])
@@ -921,13 +939,6 @@ def generate_daily_summary():
     if not config_row['summary_bark_key']:
         logger.warning("未配置总结 Bark Key，跳过每日总结通知。\n")
         return
-    if provider == 'gemini' and (not genai or not types):
-        logger.error("Gemini SDK 未加载，无法生成总结。\n")
-        return
-    if provider == 'openai' and not OpenAI:
-        logger.error("OpenAI SDK 未加载，无法生成总结。请安装 openai 依赖。\n")
-        return
-
     titles = get_daily_feed_titles()
     interval_hours = config_row['interval_hours'] if config_row['interval_hours'] is not None else 24
     if not titles:
@@ -1443,9 +1454,6 @@ def summary_config_models():
     db_config_row = get_summary_config()
 
     if provider == 'openai':
-        if not OpenAI:
-            return jsonify({'success': False, 'message': 'OpenAI SDK 未加载，无法获取模型列表。'}), 500
-
         api_key_input = (payload.get('openai_api_key') or '').strip()
         stored_api_key = db_config_row['openai_api_key'] if db_config_row and db_config_row['openai_api_key'] else ''
         api_key = stored_api_key if api_key_input == '********' or not api_key_input else api_key_input
@@ -1459,6 +1467,7 @@ def summary_config_models():
         openai_base_url = base_url_input if has_base_url_payload else stored_base_url
 
         try:
+            OpenAI = load_openai_sdk()
             client = OpenAI(**build_openai_client_kwargs(api_key, openai_base_url))
             models = extract_model_ids(client.models.list())
             if not models:
@@ -1468,9 +1477,6 @@ def summary_config_models():
         except Exception as e:
             logger.error(f"获取 OpenAI 模型列表失败: {e}", exc_info=True)
             return jsonify({'success': False, 'message': '获取 OpenAI 模型列表失败，请检查 API Key、Base URL、网络或应用日志。'}), 502
-
-    if not genai:
-        return jsonify({'success': False, 'message': 'Gemini SDK 未加载，无法获取模型列表。'}), 500
 
     api_key_input = (payload.get('gemini_api_key') or '').strip()
 
@@ -1485,7 +1491,8 @@ def summary_config_models():
         return jsonify({'success': False, 'message': '请先填写 Gemini API Key。'}), 400
 
     try:
-        client = genai.Client(api_key=api_key)
+        genai_module, _, _ = load_gemini_sdk()
+        client = genai_module.Client(api_key=api_key)
         models = []
         for model in client.models.list():
             supported_actions = getattr(model, 'supported_actions', []) or []
@@ -1517,12 +1524,6 @@ def test_summary():
         return redirect(url_for('summary_config'))
     if not config_row['summary_bark_key']:
         flash('未配置总结 Bark Key，无法测试总结通知。', 'error')
-        return redirect(url_for('summary_config'))
-    if provider == 'gemini' and (not genai or not types):
-        flash("Gemini SDK 未加载，无法测试总结。", "error")
-        return redirect(url_for('summary_config'))
-    if provider == 'openai' and not OpenAI:
-        flash("OpenAI SDK 未加载，无法测试总结。请安装 openai 依赖。", "error")
         return redirect(url_for('summary_config'))
 
     titles = get_daily_feed_titles()
