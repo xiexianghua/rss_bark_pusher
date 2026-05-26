@@ -49,6 +49,13 @@
                         <label class="block text-gray-700 font-medium mb-1" for="bark_key">Bark Key:</label>
                         <input type="text" id="bark_key" name="bark_key" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" required>
                     </div>
+                    <div>
+                        <label class="block text-gray-700 font-medium mb-1" for="bark_level">Bark 推送级别:</label>
+                        <select id="bark_level" name="bark_level" class="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="">普通推送</option>
+                            <option value="timeSensitive">时效性推送</option>
+                        </select>
+                    </div>
                 </div>
                 <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-opacity-50">添加订阅</button>
             </form>
@@ -66,6 +73,7 @@
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">URL</th>
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">间隔(分)</th>
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">Bark Key (部分)</th>
+                            <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">推送级别</th>
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">上次检查</th>
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">状态</th>
                             <th class="p-3 text-xs font-medium text-gray-600 uppercase tracking-wider">操作</th>
@@ -93,6 +101,14 @@
                                 <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
                                     <span class="font-semibold text-gray-600 md:hidden">Bark Key (部分): </span>
                                     <span class="text-sm text-gray-900">{{ sub.bark_key[:8] }}...</span>
+                                </td>
+                                <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
+                                    <span class="font-semibold text-gray-600 md:hidden">推送级别: </span>
+                                    {% if sub.bark_level == 'timeSensitive' %}
+                                        <span class="text-sm text-orange-600 font-medium">时效性</span>
+                                    {% else %}
+                                        <span class="text-sm text-gray-500">普通</span>
+                                    {% endif %}
                                 </td>
                                 <td class="block md:table-cell p-3 border-b md:border-b-0 border-gray-100">
                                     <span class="font-semibold text-gray-600 md:hidden">上次检查: </span>

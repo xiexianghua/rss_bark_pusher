@@ -40,6 +40,13 @@
                     <label class="block text-gray-700 font-medium mb-2" for="bark_key">Bark Key:</label>
                     <input type="text" id="bark_key" name="bark_key" value="{{ subscription.bark_key }}" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600" required>
                 </div>
+                <div class="mb-4">
+                    <label class="block text-gray-700 font-medium mb-2" for="bark_level">Bark 推送级别:</label>
+                    <select id="bark_level" name="bark_level" class="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600">
+                        <option value="" {% if not subscription.bark_level %}selected{% endif %}>普通推送</option>
+                        <option value="timeSensitive" {% if subscription.bark_level == 'timeSensitive' %}selected{% endif %}>时效性推送</option>
+                    </select>
+                </div>
                 <div class="flex space-x-4">
                     <button type="submit" class="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">保存更改</button>
                     <a href="{{ url_for('index') }}" class="w-full text-center bg-gray-300 text-gray-800 px-4 py-2 rounded-md hover:bg-gray-400">取消</a>

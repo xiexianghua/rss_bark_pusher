@@ -113,12 +113,19 @@ scheduler = BackgroundScheduler(
 )
 
 # --- 数据库操作函数 (订阅相关) ---
-def add_sub_to_db(name, url, interval_minutes, bark_key):
+ALLOWED_BARK_LEVELS = {'', 'timeSensitive'}
+
+def normalize_bark_level(level):
+    level_value = (level or '').strip()
+    return level_value if level_value in ALLOWED_BARK_LEVELS else ''
+
+def add_sub_to_db(name, url, interval_minutes, bark_key, bark_level=''):
     try:
+        normalized_bark_level = normalize_bark_level(bark_level)
         with get_db_connection() as conn:
             cursor = conn.execute(
-                "INSERT INTO subscriptions (name, url, interval_minutes, bark_key, is_active, created_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (name, url, interval_minutes, bark_key, True, datetime.now(timezone.utc), None)
+                "INSERT INTO subscriptions (name, url, interval_minutes, bark_key, bark_level, is_active, created_at, last_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (name, url, interval_minutes, bark_key, normalized_bark_level, True, datetime.now(timezone.utc), None)
             )
             conn.commit()
             return cursor.lastrowid
@@ -201,14 +208,15 @@ def toggle_subscription_active_status_in_db(sub_id):
         logger.error(f"切换订阅 {sub_id} 状态时发生数据库错误: {e}")
         return None
 
-def update_subscription_details_in_db(sub_id, name, url, interval_minutes, bark_key):
+def update_subscription_details_in_db(sub_id, name, url, interval_minutes, bark_key, bark_level=''):
     try:
+        normalized_bark_level = normalize_bark_level(bark_level)
         with get_db_connection() as conn:
             conn.execute(
                 """UPDATE subscriptions
-                   SET name = ?, url = ?, interval_minutes = ?, bark_key = ?
+                   SET name = ?, url = ?, interval_minutes = ?, bark_key = ?, bark_level = ?
                    WHERE id = ?""",
-                (name, url, interval_minutes, bark_key, sub_id)
+                (name, url, interval_minutes, bark_key, normalized_bark_level, sub_id)
             )
             conn.commit()
             return True
@@ -662,6 +670,7 @@ def process_feed(subscription_id, is_test_run=False):
     if not sub:
         logger.warning(f"订阅 {subscription_id} 在 process_feed 中未找到，跳过处理。\n")
         return
+    bark_level = normalize_bark_level(sub['bark_level'] if 'bark_level' in sub.keys() else '')
     
     logger.info(f"开始处理订阅: {sub['name']} ({sub['url']}) (Active: {sub['is_active']}, Test: {is_test_run})")
     update_subscription_last_checked(sub['id'])
@@ -815,7 +824,8 @@ def process_feed(subscription_id, is_test_run=False):
             body=body_content[:500],
             url=link if link else None,
             sound="glass",
-            group=sub['name']
+            group=sub['name'],
+            level=bark_level
         )
 
         if success_flag:
@@ -857,7 +867,8 @@ def process_feed(subscription_id, is_test_run=False):
             markdown=aggregated_markdown[:2000],
             url=primary_url_for_notification,
             sound="glass",
-            group=sub['name']
+            group=sub['name'],
+            level=bark_level
         )
 
         if success_flag:
@@ -1076,6 +1087,7 @@ def add_subscription():
     url = request.form.get('url', '').strip()
     interval_str = request.form.get('interval_minutes', '60').strip()
     bark_key = request.form.get('bark_key', '').strip()
+    bark_level = normalize_bark_level(request.form.get('bark_level', ''))
 
     if not all([name, url, bark_key, interval_str]):
         flash('所有字段都是必填的。', 'error')
@@ -1090,7 +1102,7 @@ def add_subscription():
         flash('抓取间隔必须是有效的数字。', 'error')
         return redirect(url_for('index'))
 
-    sub_id = add_sub_to_db(name, url, interval_minutes, bark_key)
+    sub_id = add_sub_to_db(name, url, interval_minutes, bark_key, bark_level)
     if sub_id:
         new_sub = get_subscription_by_id(sub_id)
         if new_sub:
@@ -1122,13 +1134,15 @@ def update_subscription_action(sub_id):
     url_new = request.form.get('url', '').strip()
     interval_minutes_str = request.form.get('interval_minutes', '').strip()
     bark_key = request.form.get('bark_key', '').strip()
+    bark_level = normalize_bark_level(request.form.get('bark_level', ''))
 
     current_form_data = dict(original_sub)
     current_form_data.update({
         'name': name,
         'url': url_new,
         'interval_minutes': interval_minutes_str,
-        'bark_key': bark_key
+        'bark_key': bark_key,
+        'bark_level': bark_level
     })
 
     if not all([name, url_new, bark_key, interval_minutes_str]):
@@ -1161,7 +1175,7 @@ def update_subscription_action(sub_id):
             flash("检查URL时发生数据库错误，请重试。", 'error')
             return render_template('edit_subscription.html', subscription=current_form_data)
 
-    success_db_update = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key)
+    success_db_update = update_subscription_details_in_db(sub_id, name, url_new, interval_minutes, bark_key, bark_level)
     
     if success_db_update:
         updated_sub = get_subscription_by_id(sub_id)

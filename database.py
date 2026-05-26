@@ -276,6 +276,7 @@ def init_db():
                     url TEXT NOT NULL UNIQUE,
                     interval_minutes INTEGER NOT NULL DEFAULT 60,
                     bark_key TEXT NOT NULL,
+                    bark_level TEXT NOT NULL DEFAULT '',
                     last_fetched_item_link TEXT,
                     is_active BOOLEAN NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
@@ -288,6 +289,7 @@ def init_db():
             ''')
 
             logger.info("正在检查并迁移 subscriptions 表结构...")
+            _add_column_if_not_exists(conn, "subscriptions", "bark_level", "TEXT NOT NULL DEFAULT ''")
             _add_column_if_not_exists(conn, "subscriptions", "consecutive_failures", "INTEGER NOT NULL DEFAULT 0")
             _add_column_if_not_exists(conn, "subscriptions", "last_failure_at", "TIMESTAMP")
             _add_column_if_not_exists(conn, "subscriptions", "last_failure_reason", "TEXT")
