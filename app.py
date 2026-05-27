@@ -719,11 +719,28 @@ def process_feed(subscription_id, is_test_run=False):
     def get_entry_link(entry):
         return entry.get('link')
 
+    entries_to_check = feed_data.entries
+    last_seen_link = sub['last_fetched_item_link']
+    if last_seen_link:
+        entries_before_last_seen = []
+        found_last_seen = False
+        for entry in feed_data.entries:
+            if get_entry_link(entry) == last_seen_link:
+                found_last_seen = True
+                break
+            entries_before_last_seen.append(entry)
+
+        if found_last_seen:
+            entries_to_check = entries_before_last_seen
+            logger.debug(f"订阅 {sub['name']} 在当前 feed 中找到 last_fetched_item_link，仅检查其前方 {len(entries_to_check)} 个条目。")
+        else:
+            logger.warning(f"订阅 {sub['name']} 的 last_fetched_item_link 未在当前 feed 中找到，将回退到数据库去重逻辑。")
+
     new_items_to_notify = []
     try:
         with get_db_connection() as conn:
             # 倒序遍历条目（从最旧到最新），以保持通知的正确时间顺序
-            for entry in reversed(feed_data.entries):
+            for entry in reversed(entries_to_check):
                 title = entry.get('title', '无标题')
                 link = get_entry_link(entry)
                 
